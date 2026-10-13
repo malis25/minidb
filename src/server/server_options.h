@@ -8,7 +8,6 @@
 struct ServerOptions {
     int port = 8080;
     std::filesystem::path database_directory;
-    std::string database_filename;
     std::uint64_t maximum_file_size = 0;
     bool log_requests = false;
     bool log_details = false;

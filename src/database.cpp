@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace minidb {
@@ -11,6 +12,20 @@ namespace {
 
 std::string indexed_value(const Object& value) {
     return value.dump();
+}
+
+std::vector<std::uint64_t> ordered_page(std::vector<std::uint64_t> ids, std::size_t offset,
+                                        std::size_t limit) {
+    if (limit == 0 || offset >= ids.size()) {
+        return {};
+    }
+    const auto end = offset + std::min(limit, ids.size() - offset);
+    if (end < ids.size()) {
+        std::nth_element(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(end), ids.end());
+    }
+    ids.resize(end);
+    std::sort(ids.begin(), ids.end());
+    return std::vector<std::uint64_t>(ids.begin() + static_cast<std::ptrdiff_t>(offset), ids.end());
 }
 
 } // namespace
@@ -37,50 +52,119 @@ Database::Database(std::unique_ptr<ObjectStorage> storage) : storage_(std::move(
         if (!inserted) {
             throw std::runtime_error("Storage returned duplicate object IDs.");
         }
+        ordered_ids_.insert(entry->first);
         add_to_index(entry->first, *entry->second);
     }
 }
 
 std::uint64_t Database::create(Object object) {
-    if (!object.is_object()) {
-        throw std::invalid_argument("A database object must be a JSON object.");
-    }
-    if (next_id_ == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::overflow_error("The database has exhausted its uint64 object IDs.");
-    }
-
-    const auto id = next_id_;
-    const auto following_id = id + 1;
-    auto stored_object = std::make_shared<const Object>(std::move(object));
-    if (storage_) {
-        storage_->store(id, *stored_object, following_id);
-    }
-
-    const auto [entry, inserted] = objects_.emplace(id, stored_object);
-    if (!inserted) {
-        throw std::logic_error("The next database ID is already in use.");
-    }
-    add_to_index(id, *stored_object);
-    next_id_ = following_id;
-    return id;
+    const auto ids = apply_batch({{ObjectMutation::Type::create, 0, std::move(object)}});
+    return ids.front();
 }
 
 void Database::set(std::uint64_t id, Object object) {
-    if (!object.is_object()) {
-        throw std::invalid_argument("A database object must be a JSON object.");
-    }
-    const auto existing = objects_.find(id);
-    if (existing == objects_.end()) {
-        throw std::out_of_range("Object ID does not exist.");
+    static_cast<void>(apply_batch({{ObjectMutation::Type::replace, id, std::move(object)}}));
+}
+
+std::vector<std::uint64_t> Database::apply_batch(const std::vector<ObjectMutation>& mutations) {
+    if (mutations.empty()) {
+        throw std::invalid_argument("A database batch must contain at least one operation.");
     }
 
-    auto replacement = std::make_shared<const Object>(std::move(object));
-    if (storage_) {
-        storage_->store(id, *replacement, next_id_);
+    struct PreparedMutation {
+        ObjectMutation::Type type;
+        std::uint64_t id;
+        ObjectPtr object;
+    };
+    std::vector<PreparedMutation> prepared;
+    std::vector<std::uint64_t> created_ids;
+    std::vector<StorageMutation> storage_mutations;
+    std::unordered_set<std::uint64_t> touched_ids;
+    prepared.reserve(mutations.size());
+    created_ids.reserve(mutations.size());
+    storage_mutations.reserve(mutations.size());
+    touched_ids.reserve(mutations.size());
+    auto following_id = next_id_;
+
+    for (const auto& mutation : mutations) {
+        switch (mutation.type) {
+        case ObjectMutation::Type::create: {
+            if (!mutation.object.is_object()) {
+                throw std::invalid_argument("A database object must be a JSON object.");
+            }
+            if (!is_within_object_nesting_depth(mutation.object)) {
+                throw std::invalid_argument("JSON nesting exceeds the maximum depth of 128.");
+            }
+            if (following_id == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::overflow_error("The database has exhausted its uint64 object IDs.");
+            }
+            const auto id = following_id++;
+            auto object = std::make_shared<const Object>(mutation.object);
+            prepared.push_back({mutation.type, id, object});
+            storage_mutations.push_back({StorageMutationType::store, id, *object});
+            created_ids.push_back(id);
+            break;
+        }
+        case ObjectMutation::Type::replace: {
+            if (!mutation.object.is_object()) {
+                throw std::invalid_argument("A database object must be a JSON object.");
+            }
+            if (!is_within_object_nesting_depth(mutation.object)) {
+                throw std::invalid_argument("JSON nesting exceeds the maximum depth of 128.");
+            }
+            if (!touched_ids.insert(mutation.id).second) {
+                throw std::invalid_argument(
+                    "A batch cannot mutate the same object more than once.");
+            }
+            if (!objects_.contains(mutation.id)) {
+                throw std::out_of_range("Object ID does not exist.");
+            }
+            auto object = std::make_shared<const Object>(mutation.object);
+            prepared.push_back({mutation.type, mutation.id, object});
+            storage_mutations.push_back({StorageMutationType::store, mutation.id, *object});
+            break;
+        }
+        case ObjectMutation::Type::erase:
+            if (!touched_ids.insert(mutation.id).second) {
+                throw std::invalid_argument(
+                    "A batch cannot mutate the same object more than once.");
+            }
+            if (!objects_.contains(mutation.id)) {
+                throw std::out_of_range("Object ID does not exist.");
+            }
+            prepared.push_back({mutation.type, mutation.id, nullptr});
+            storage_mutations.push_back({StorageMutationType::erase, mutation.id, {}});
+            break;
+        default:
+            throw std::invalid_argument("Batch contains an unknown operation type.");
+        }
     }
-    remove_from_index(id, *existing->second);
-    existing->second = std::move(replacement);
-    add_to_index(id, *existing->second);
+
+    if (storage_) {
+        storage_->apply_batch(storage_mutations, following_id);
+    }
+
+    for (const auto& mutation : prepared) {
+        const auto existing = objects_.find(mutation.id);
+        if (mutation.type == ObjectMutation::Type::create) {
+            const auto [entry, inserted] = objects_.emplace(mutation.id, mutation.object);
+            if (!inserted) {
+                throw std::logic_error("The next database ID is already in use.");
+            }
+            ordered_ids_.insert(entry->first);
+            add_to_index(entry->first, *entry->second);
+        } else if (mutation.type == ObjectMutation::Type::replace) {
+            remove_from_index(mutation.id, *existing->second);
+            existing->second = mutation.object;
+            add_to_index(mutation.id, *existing->second);
+        } else {
+            remove_from_index(mutation.id, *existing->second);
+            ordered_ids_.erase(mutation.id);
+            objects_.erase(existing);
+        }
+    }
+    next_id_ = following_id;
+    return created_ids;
 }
 
 std::shared_ptr<const Object> Database::get(std::uint64_t id) const {
@@ -93,11 +177,7 @@ bool Database::remove(std::uint64_t id) {
     if (object == objects_.end()) {
         return false;
     }
-    if (storage_) {
-        storage_->erase(id);
-    }
-    remove_from_index(id, *object->second);
-    objects_.erase(object);
+    static_cast<void>(apply_batch({{ObjectMutation::Type::erase, id, {}}}));
     return true;
 }
 
@@ -120,7 +200,40 @@ std::vector<std::uint64_t> Database::ids() const {
     return result;
 }
 
+std::vector<std::uint64_t> Database::ids(std::size_t offset, std::size_t limit) const {
+    if (limit == 0 || offset >= objects_.size()) {
+        return {};
+    }
+    std::vector<std::uint64_t> all_ids;
+    all_ids.reserve(objects_.size());
+    for (const auto& [id, object] : objects_) {
+        static_cast<void>(object);
+        all_ids.push_back(id);
+    }
+    return ordered_page(std::move(all_ids), offset, limit);
+}
+
+IdPage Database::ids_after(std::optional<std::uint64_t> after_id, std::size_t limit) const {
+    IdPage result;
+    result.total = objects_.size();
+    if (limit == 0) {
+        return result;
+    }
+    auto id = after_id ? ordered_ids_.upper_bound(*after_id) : ordered_ids_.begin();
+    result.ids.reserve(std::min(limit, ordered_ids_.size()));
+    while (id != ordered_ids_.end() && result.ids.size() < limit) {
+        result.ids.push_back(*id++);
+    }
+    result.has_more = id != ordered_ids_.end();
+    return result;
+}
+
 std::vector<ObjectMatch> Database::find(std::string_view field, const Object& value) const {
+    return find(field, value, 0, std::numeric_limits<std::size_t>::max()).matches;
+}
+
+ObjectMatchPage Database::find(std::string_view field, const Object& value, std::size_t offset,
+                               std::size_t limit) const {
     const auto field_entry = field_index_.find(field);
     if (field_entry == field_index_.end()) {
         return {};
@@ -129,18 +242,51 @@ std::vector<ObjectMatch> Database::find(std::string_view field, const Object& va
     if (matching_ids == field_entry->second.end()) {
         return {};
     }
+    ObjectMatchPage result;
+    result.total = matching_ids->second.size();
+    if (limit == 0 || offset >= result.total) {
+        return result;
+    }
 
-    std::vector<std::uint64_t> ordered_ids(matching_ids->second.begin(),
-                                           matching_ids->second.end());
-    std::sort(ordered_ids.begin(), ordered_ids.end());
-    std::vector<ObjectMatch> result;
-    result.reserve(ordered_ids.size());
-    for (const auto id : ordered_ids) {
+    std::vector<std::uint64_t> matching_id_list(matching_ids->second.begin(),
+                                                matching_ids->second.end());
+    auto selected_ids = ordered_page(std::move(matching_id_list), offset, limit);
+    result.matches.reserve(selected_ids.size());
+    for (const auto id : selected_ids) {
         const auto object = objects_.find(id);
         if (object != objects_.end()) {
-            result.push_back({id, object->second});
+            result.matches.push_back({id, object->second});
         }
     }
+    return result;
+}
+
+ObjectMatchPage Database::find_after(std::string_view field, const Object& value,
+                                     std::optional<std::uint64_t> after_id,
+                                     std::size_t limit) const {
+    const auto field_entry = field_index_.find(field);
+    if (field_entry == field_index_.end()) {
+        return {};
+    }
+    const auto matching_ids = field_entry->second.find(indexed_value(value));
+    if (matching_ids == field_entry->second.end()) {
+        return {};
+    }
+    ObjectMatchPage result;
+    result.total = matching_ids->second.size();
+    if (limit == 0) {
+        return result;
+    }
+    auto id = after_id ? matching_ids->second.upper_bound(*after_id) : matching_ids->second.begin();
+    result.matches.reserve(std::min(limit, matching_ids->second.size()));
+    while (id != matching_ids->second.end() && result.matches.size() < limit) {
+        const auto object = objects_.find(*id);
+        if (object != objects_.end()) {
+            result.matches.push_back({*id, object->second});
+        }
+        ++id;
+    }
+    result.has_more = id != matching_ids->second.end();
     return result;
 }
 

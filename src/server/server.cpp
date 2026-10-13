@@ -1,10 +1,8 @@
 #include "server.h" // Server startup module.
 #include "database_api.h"
+#include "database_catalog.h"
 #include "request_logging.h"
 #include "server_options.h"
-
-#include "minidb/database.h"
-#include "minidb/storage.h"
 
 #include <httplib.h>
 
@@ -45,23 +43,16 @@ int minidb::server::run(int argc, char* argv[]) {
         }
         const auto& options = *parsed_options;
 
-        // Resolve all storage paths from the explicit CLI directory and filename.
-        // Creating the parent directory is convenient, but no default location is used.
-        std::filesystem::create_directories(options.database_directory);
-        // The manifest describes the segment set and next numeric object ID.
-        auto storage = std::make_unique<minidb::SegmentedStorage>(
-            options.database_directory, options.database_filename, options.maximum_file_size);
-        const auto manifest_file = storage->manifest_path();
-        minidb::Database database{std::move(storage)};
+        DatabaseCatalog catalog{options.database_directory, options.maximum_file_size};
 
         httplib::Server server;
         server.set_payload_max_length(maximum_request_size);
         configure_socket_options(server);
 
         // These separate objects keep responsibilities isolated:
-        // routes operate on Database, logging formats console records, and this
-        // function owns startup, storage loading, and the listening socket.
-        DatabaseApi database_api{database};
+        // Routes manage the catalog and its databases, while this function owns
+        // startup, request logging, and the listening socket.
+        DatabaseApi database_api{catalog};
         database_api.register_routes(server);
         configure_request_logging(server, options);
 
@@ -72,7 +63,7 @@ int minidb::server::run(int argc, char* argv[]) {
         }
 
         std::cout << "MiniDB HTTP API listening on http://" << listen_address << ':' << options.port
-                  << "\nDatabase manifest: " << manifest_file.string()
+                  << "\nDatabase root: " << options.database_directory.string()
                   << "\nMaximum segment size: " << options.maximum_file_size << " bytes"
                   << std::endl;
         if (!server.listen_after_bind()) {

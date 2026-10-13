@@ -22,14 +22,41 @@ namespace minidb {
 namespace {
 
 constexpr std::array<char, 8> segment_signature{'M', 'I', 'N', 'I', 'D', 'B', '2', '\0'};
-constexpr std::string_view manifest_format = "MINIDB-MANIFEST-1";
+constexpr std::string_view legacy_manifest_format = "MINIDB-MANIFEST-1";
+constexpr std::string_view manifest_format = "MINIDB-MANIFEST-2";
 constexpr char store_operation = 'S';
 constexpr char erase_operation = 'E';
+constexpr char batch_operation = 'T';
 constexpr std::uint64_t header_size = segment_signature.size();
 constexpr std::uint64_t record_length_size = sizeof(std::uint64_t);
 constexpr std::uint64_t record_prefix_size = 1 + sizeof(std::uint64_t);
 constexpr std::uint64_t minimum_object_record_size =
     header_size + record_length_size + record_prefix_size + sizeof(std::uint64_t) + 2;
+
+bool path_exists_without_following_symlinks(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory) {
+        return false;
+    }
+    if (error) {
+        throw std::system_error(error, "Could not inspect database path: " + path.string());
+    }
+    return status.type() != std::filesystem::file_type::not_found;
+}
+
+void require_regular_file(const std::filesystem::path& path, std::string_view description) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error) {
+        throw std::system_error(error, "Could not inspect " + std::string(description) + ": " +
+                                           path.string());
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+        throw std::runtime_error(std::string(description) +
+                                 " is not a regular file: " + path.string());
+    }
+}
 
 bool is_segment_filename(std::string_view filename, std::string_view database_name) {
     const auto prefix = std::string(database_name) + ".segment-";
@@ -91,6 +118,26 @@ void replace_file(const std::filesystem::path& temporary,
 
 } // namespace
 
+bool is_valid_database_name(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 63 || name.front() < 'a' || name.front() > 'z') {
+        return false;
+    }
+    const bool valid_characters =
+        std::all_of(name.begin() + 1, name.end(), [](unsigned char character) {
+            return (character >= 'a' && character <= 'z') ||
+                   (character >= '0' && character <= '9') || character == '-' || character == '_';
+        });
+    if (!valid_characters) {
+        return false;
+    }
+    if (name == "con" || name == "prn" || name == "aux" || name == "nul") {
+        return false;
+    }
+    return !((name.size() == 4 && name.starts_with("com")) ||
+             (name.size() == 4 && name.starts_with("lpt"))) ||
+           (name.back() < '1' || name.back() > '9');
+}
+
 SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string database_name,
                                    std::uint64_t maximum_segment_size)
     : directory_(std::move(directory)), database_name_(std::move(database_name)),
@@ -98,10 +145,8 @@ SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string 
     if (directory_.empty()) {
         throw std::invalid_argument("Database directory cannot be empty.");
     }
-    const std::filesystem::path name_path{database_name_};
-    if (database_name_.empty() || name_path.has_parent_path() || database_name_ == "." ||
-        database_name_ == "..") {
-        throw std::invalid_argument("Database name must be a file name, not a path.");
+    if (!is_valid_database_name(database_name_)) {
+        throw std::invalid_argument("Invalid database name.");
     }
     if (maximum_segment_size_ < minimum_object_record_size) {
         throw std::invalid_argument("Maximum file size is too small for a database object.");
@@ -116,7 +161,12 @@ const std::filesystem::path& SegmentedStorage::manifest_path() const noexcept {
 StorageSnapshot SegmentedStorage::load() {
     std::filesystem::create_directories(directory_);
     std::unordered_map<std::uint64_t, Object> objects;
-    bool initialize = !std::filesystem::exists(manifest_path_);
+    const bool manifest_exists = path_exists_without_following_symlinks(manifest_path_);
+    if (manifest_exists) {
+        require_regular_file(manifest_path_, "Database manifest");
+    }
+    const bool initialize = !manifest_exists;
+    bool manifest_needs_save = false;
     bool has_existing_segments = false;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
         if (is_segment_filename(entry.path().filename().string(), database_name_)) {
@@ -147,7 +197,11 @@ StorageSnapshot SegmentedStorage::load() {
         } catch (const nlohmann::json::exception& error) {
             throw std::runtime_error("Invalid database manifest: " + std::string(error.what()));
         }
-        if (!manifest.is_object() || manifest.value("format", std::string{}) != manifest_format ||
+        if (!manifest.is_object()) {
+            throw std::runtime_error("Database manifest has an unsupported or invalid format.");
+        }
+        const auto manifest_version = manifest.value("format", std::string{});
+        if ((manifest_version != legacy_manifest_format && manifest_version != manifest_format) ||
             !manifest.contains("next_id") || !manifest["next_id"].is_number_unsigned() ||
             !manifest.contains("maximum_segment_size") ||
             !manifest["maximum_segment_size"].is_number_unsigned() ||
@@ -175,11 +229,31 @@ StorageSnapshot SegmentedStorage::load() {
 
         for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
             const auto filename = entry.path().filename().string();
-            if (is_segment_filename(filename, database_name_) &&
-                std::find(segment_files_.begin(), segment_files_.end(), filename) ==
+            if (is_segment_filename(filename, database_name_)) {
+                require_regular_file(entry.path(), "Database segment");
+                if (std::find(segment_files_.begin(), segment_files_.end(), filename) ==
                     segment_files_.end()) {
-                throw std::runtime_error(
-                    "Database directory contains a segment not listed in the manifest.");
+                    std::ostringstream expected_name;
+                    expected_name << database_name_ << ".segment-" << std::setw(8)
+                                  << std::setfill('0') << segment_files_.size() << ".minidb";
+                    const auto orphan_path = entry.path();
+                    bool is_recoverable_empty_segment =
+                        filename == expected_name.str() &&
+                        std::filesystem::file_size(orphan_path) == header_size;
+                    if (is_recoverable_empty_segment) {
+                        std::ifstream orphan(orphan_path, std::ios::binary);
+                        std::array<char, segment_signature.size()> signature{};
+                        orphan.read(signature.data(),
+                                    static_cast<std::streamsize>(signature.size()));
+                        is_recoverable_empty_segment = orphan && signature == segment_signature;
+                    }
+                    if (!is_recoverable_empty_segment) {
+                        throw std::runtime_error(
+                            "Database directory contains an unexpected segment file.");
+                    }
+                    segment_files_.push_back(filename);
+                    manifest_needs_save = true;
+                }
             }
         }
     }
@@ -187,12 +261,15 @@ StorageSnapshot SegmentedStorage::load() {
     auto recovered_next_id = next_id_;
     for (std::size_t index = 0; index < segment_files_.size(); ++index) {
         const auto segment_path = directory_ / segment_files_[index];
-        if (!std::filesystem::exists(segment_path)) {
-            if (index + 1 != segment_files_.size()) {
-                throw std::runtime_error("A database segment listed in the manifest is missing.");
+        if (!path_exists_without_following_symlinks(segment_path)) {
+            if (index + 1 != segment_files_.size() || segment_files_.size() != 1 || next_id_ != 0) {
+                throw std::runtime_error(
+                    "A database segment listed in the manifest is missing; refusing to "
+                    "reinitialize potentially lost data.");
             }
             create_segment(segment_files_[index]);
         }
+        require_regular_file(segment_path, "Database segment");
         const auto segment_size = std::filesystem::file_size(segment_path);
         if (segment_size > maximum_segment_size_) {
             throw std::runtime_error("Database segment exceeds the configured maximum size.");
@@ -256,7 +333,15 @@ StorageSnapshot SegmentedStorage::load() {
                 if (object_size != record.size() - offset) {
                     throw std::runtime_error("Database object record has an invalid payload size.");
                 }
-                auto object = Object::parse(std::string_view{record}.substr(offset));
+                auto object = Object::parse(
+                    std::string_view{record}.substr(offset),
+                    [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+                        if (depth > maximum_object_nesting_depth) {
+                            throw std::length_error(
+                                "Stored JSON nesting exceeds the maximum depth of 128.");
+                        }
+                        return true;
+                    });
                 if (!object.is_object()) {
                     throw std::runtime_error("Database record does not contain a JSON object.");
                 }
@@ -266,6 +351,67 @@ StorageSnapshot SegmentedStorage::load() {
                     throw std::runtime_error("Database deletion record contains trailing data.");
                 }
                 objects.erase(id);
+            } else if (operation == batch_operation) {
+                const auto mutation_count = read_u64(record, offset);
+                if (mutation_count == 0 ||
+                    mutation_count >
+                        static_cast<std::uint64_t>(record.size() - offset) / record_prefix_size) {
+                    throw std::runtime_error(
+                        "Database batch record has an invalid operation count.");
+                }
+                std::vector<StorageMutation> mutations;
+                mutations.reserve(static_cast<std::size_t>(mutation_count));
+                for (std::uint64_t mutation_index = 0; mutation_index < mutation_count;
+                     ++mutation_index) {
+                    if (offset == record.size()) {
+                        throw std::runtime_error("Database batch record is truncated.");
+                    }
+                    const auto mutation_operation = record[offset++];
+                    const auto mutation_id = read_u64(record, offset);
+                    if (mutation_operation == store_operation) {
+                        const auto object_size = read_u64(record, offset);
+                        if (object_size > record.size() - offset) {
+                            throw std::runtime_error("Database batch object is truncated.");
+                        }
+                        auto object = Object::parse(
+                            std::string_view{record}.substr(offset,
+                                                            static_cast<std::size_t>(object_size)),
+                            [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+                                if (depth > maximum_object_nesting_depth) {
+                                    throw std::length_error(
+                                        "Stored JSON nesting exceeds the maximum depth of 128.");
+                                }
+                                return true;
+                            });
+                        if (!object.is_object()) {
+                            throw std::runtime_error(
+                                "Database batch record does not contain a JSON object.");
+                        }
+                        offset += static_cast<std::size_t>(object_size);
+                        mutations.push_back(
+                            {StorageMutationType::store, mutation_id, std::move(object)});
+                        if (mutation_id == std::numeric_limits<std::uint64_t>::max()) {
+                            recovered_next_id = mutation_id;
+                        } else {
+                            recovered_next_id = std::max(recovered_next_id, mutation_id + 1);
+                        }
+                    } else if (mutation_operation == erase_operation) {
+                        mutations.push_back({StorageMutationType::erase, mutation_id, {}});
+                    } else {
+                        throw std::runtime_error(
+                            "Database batch record contains an unknown operation.");
+                    }
+                }
+                if (offset != record.size()) {
+                    throw std::runtime_error("Database batch record contains trailing data.");
+                }
+                for (auto& mutation : mutations) {
+                    if (mutation.type == StorageMutationType::store) {
+                        objects.insert_or_assign(mutation.id, std::move(mutation.object));
+                    } else {
+                        objects.erase(mutation.id);
+                    }
+                }
             } else {
                 throw std::runtime_error("Database segment contains an unknown operation.");
             }
@@ -275,7 +421,7 @@ StorageSnapshot SegmentedStorage::load() {
         }
     }
 
-    if (recovered_next_id != next_id_) {
+    if (recovered_next_id != next_id_ || manifest_needs_save) {
         next_id_ = recovered_next_id;
         save_manifest();
     }
@@ -293,6 +439,9 @@ void SegmentedStorage::store(std::uint64_t id, const Object& object, std::uint64
     if (!object.is_object()) {
         throw std::invalid_argument("A database object must be a JSON object.");
     }
+    if (!is_within_object_nesting_depth(object)) {
+        throw std::invalid_argument("JSON nesting exceeds the maximum depth of 128.");
+    }
     if (id > next_id_ || next_id < next_id_ || (id == next_id_ && next_id != id + 1)) {
         throw std::invalid_argument("Object ID and next-ID metadata are inconsistent.");
     }
@@ -303,12 +452,54 @@ void SegmentedStorage::erase(std::uint64_t id) {
     append_record(erase_operation, id, nullptr, next_id_);
 }
 
-void SegmentedStorage::append_record(char operation, std::uint64_t id, const Object* object,
-                                     std::uint64_t next_id) {
-    if (segment_files_.empty()) {
-        throw std::logic_error("Database storage must be loaded before writing records.");
+void SegmentedStorage::apply_batch(const std::vector<StorageMutation>& mutations,
+                                   std::uint64_t next_id) {
+    if (mutations.empty()) {
+        throw std::invalid_argument("A storage batch must contain at least one operation.");
+    }
+    if (next_id < next_id_) {
+        throw std::invalid_argument("Batch next-ID metadata cannot move backwards.");
+    }
+    if (mutations.size() == 1) {
+        const auto& mutation = mutations.front();
+        if (mutation.type == StorageMutationType::store) {
+            if (!mutation.object.is_object() || !is_within_object_nesting_depth(mutation.object) ||
+                mutation.id >= next_id) {
+                throw std::invalid_argument("Batch contains an invalid stored object or ID.");
+            }
+            append_record(store_operation, mutation.id, &mutation.object, next_id);
+        } else {
+            append_record(erase_operation, mutation.id, nullptr, next_id_);
+        }
+        return;
     }
 
+    save_manifest();
+    std::string record;
+    record.push_back(batch_operation);
+    append_u64(record, 0);
+    append_u64(record, static_cast<std::uint64_t>(mutations.size()));
+    for (const auto& mutation : mutations) {
+        if (mutation.type == StorageMutationType::store) {
+            if (!mutation.object.is_object() || !is_within_object_nesting_depth(mutation.object) ||
+                mutation.id >= next_id) {
+                throw std::invalid_argument("Batch contains an invalid stored object or ID.");
+            }
+            const auto json = mutation.object.dump();
+            record.push_back(store_operation);
+            append_u64(record, mutation.id);
+            append_u64(record, static_cast<std::uint64_t>(json.size()));
+            record.append(json);
+        } else {
+            record.push_back(erase_operation);
+            append_u64(record, mutation.id);
+        }
+    }
+    append_payload(std::move(record), next_id, true);
+}
+
+void SegmentedStorage::append_record(char operation, std::uint64_t id, const Object* object,
+                                     std::uint64_t next_id) {
     std::string record;
     record.push_back(operation);
     append_u64(record, id);
@@ -317,15 +508,39 @@ void SegmentedStorage::append_record(char operation, std::uint64_t id, const Obj
         append_u64(record, static_cast<std::uint64_t>(json.size()));
         record.append(json);
     }
+    append_payload(std::move(record), next_id, true);
+}
+
+void SegmentedStorage::append_payload(std::string record, std::uint64_t next_id,
+                                      bool update_next_id) {
+    if (segment_files_.empty()) {
+        throw std::logic_error("Database storage must be loaded before writing records.");
+    }
     if (record.size() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
         throw std::length_error("Database record is too large to write.");
     }
 
     auto segment_path = directory_ / segment_files_.back();
-    if (!std::filesystem::exists(segment_path)) {
-        create_segment(segment_files_.back());
+    if (!path_exists_without_following_symlinks(segment_path)) {
+        throw std::runtime_error("Active database segment is missing: " + segment_path.string());
     }
+    require_regular_file(segment_path, "Active database segment");
     auto segment_size = std::filesystem::file_size(segment_path);
+    if (segment_size < header_size || segment_size > maximum_segment_size_) {
+        throw std::runtime_error("Active database segment has an invalid size: " +
+                                 segment_path.string());
+    }
+    {
+        std::ifstream input(segment_path, std::ios::binary);
+        std::array<char, segment_signature.size()> signature{};
+        input.read(signature.data(), static_cast<std::streamsize>(signature.size()));
+        if (!input || signature != segment_signature) {
+            throw std::runtime_error("Invalid database segment header: " + segment_path.string());
+        }
+    }
+    if (record.size() > std::numeric_limits<std::uint64_t>::max() - record_length_size) {
+        throw std::length_error("Database record is too large to write.");
+    }
     const auto bytes_to_write = record_length_size + record.size();
     if (bytes_to_write > maximum_segment_size_ - header_size) {
         throw std::length_error("Object is too large to fit in a database segment.");
@@ -334,15 +549,27 @@ void SegmentedStorage::append_record(char operation, std::uint64_t id, const Obj
         std::ostringstream next_name;
         next_name << database_name_ << ".segment-" << std::setw(8) << std::setfill('0')
                   << segment_files_.size() << ".minidb";
-        segment_files_.push_back(next_name.str());
+        const auto next_segment_name = next_name.str();
+        const auto next_segment_path = directory_ / next_segment_name;
+        if (path_exists_without_following_symlinks(next_segment_path)) {
+            throw std::runtime_error("Unexpected next database segment already exists: " +
+                                     next_segment_path.string());
+        }
+        create_segment(next_segment_name);
+        segment_files_.push_back(next_segment_name);
         try {
             save_manifest();
         } catch (...) {
             segment_files_.pop_back();
+            std::error_code cleanup_error;
+            std::filesystem::remove(next_segment_path, cleanup_error);
+            if (cleanup_error) {
+                throw std::system_error(cleanup_error,
+                                        "Could not remove an uncommitted database segment");
+            }
             throw;
         }
-        create_segment(segment_files_.back());
-        segment_path = directory_ / segment_files_.back();
+        segment_path = next_segment_path;
         segment_size = header_size;
     }
 
@@ -364,7 +591,7 @@ void SegmentedStorage::append_record(char operation, std::uint64_t id, const Obj
         throw std::runtime_error("Could not append database record: " + segment_path.string());
     }
 
-    if (next_id != next_id_) {
+    if (update_next_id && next_id != next_id_) {
         const auto previous_next_id = next_id_;
         next_id_ = next_id;
         try {
@@ -391,6 +618,9 @@ void SegmentedStorage::save_manifest() {
     };
     auto temporary_path = manifest_path_;
     temporary_path += ".tmp";
+    if (path_exists_without_following_symlinks(temporary_path)) {
+        require_regular_file(temporary_path, "Temporary database manifest");
+    }
     std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error("Could not write database manifest: " + temporary_path.string());
@@ -406,9 +636,9 @@ void SegmentedStorage::save_manifest() {
 
 void SegmentedStorage::create_segment(const std::string& filename) {
     const auto segment_path = directory_ / filename;
-    if (std::filesystem::exists(segment_path)) {
-        if (!std::filesystem::is_regular_file(segment_path) ||
-            std::filesystem::file_size(segment_path) != header_size) {
+    if (path_exists_without_following_symlinks(segment_path)) {
+        require_regular_file(segment_path, "Database segment");
+        if (std::filesystem::file_size(segment_path) != header_size) {
             throw std::runtime_error("Unexpected data in new database segment: " +
                                      segment_path.string());
         }

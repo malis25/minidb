@@ -1,22 +1,19 @@
 #pragma once
 
-#include "minidb/database.h"
-
-#include <mutex>
+#include "database_catalog.h"
 
 namespace httplib {
 class Server;
 }
 
-// Connect HTTP routes to the object database. The API serializes route access;
-// persistence remains the responsibility of Database's storage backend.
+// HTTP routes use a catalog for database lifecycle and a per-database lock for
+// object operations, allowing independent databases to serve requests in parallel.
 class DatabaseApi {
   public:
-    explicit DatabaseApi(minidb::Database& database);
+    explicit DatabaseApi(DatabaseCatalog& catalog);
 
     void register_routes(httplib::Server& server);
 
   private:
-    minidb::Database& database_;
-    std::mutex database_mutex_;
+    DatabaseCatalog& catalog_;
 };

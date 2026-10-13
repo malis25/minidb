@@ -5,9 +5,10 @@ HTTP API. The database assigns each object a sequential `uint64_t` ID beginning
 at `0`. It maintains an in-memory hash index by ID and equality indexes for
 top-level object properties such as `email`, `username`, or `id`.
 
-This is an early database MVP: it does not yet provide transactions, range
-queries, field-path indexing, compaction, concurrent process access, or a
-distributed storage engine.
+This is an early database MVP. It provides atomic batches within one database,
+but not transactions across databases, range queries, field-path indexing,
+compaction, or a distributed storage engine. Only one process may open a data
+root at a time.
 
 ## Build and test
 
@@ -23,15 +24,33 @@ CMake fetches cpp-httplib, nlohmann/json, and GoogleTest (GoogleTest only when
 ## Run
 
 ```powershell
-.\build\Debug\minidb.exe --db-dir data --db-file users --max-file-size 67108864
+.\build\Debug\minidb.exe --db-dir data --max-file-size 67108864
 ```
 
-`--db-dir`, `--db-file`, and `--max-file-size` are required. The size is in
-bytes and applies to each data segment. The server creates an empty manifest
-and first segment if needed. Use `--help` for all options or `--version` for
-the executable version.
+`--db-dir` and `--max-file-size` are required. The directory is the root for
+all databases; each database has its own subdirectory and segment-size limit.
+Use `--help` for all options or `--version` for the executable version.
 
-## Objects and generated IDs
+## Databases and generated IDs
+
+Create separate databases for separate collections of objects. Database names
+start with a lowercase letter and use lowercase letters, digits, hyphens, or
+underscores.
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/databases `
+  -H "Content-Type: application/json" `
+  --data '{"name":"users"}'
+curl.exe -X POST http://127.0.0.1:8080/databases `
+  -H "Content-Type: application/json" `
+  --data '{"name":"messages"}'
+curl.exe http://127.0.0.1:8080/databases
+```
+
+Each database has its own ID sequence, starting at zero, and its own data
+directory. IDs in `users` and `messages` are independent.
+
+## Objects and queries
 
 Applications send complete JSON objects. Fields may be strings, integers,
 floating-point values, booleans, nulls, arrays, or nested objects. The database
@@ -40,17 +59,25 @@ property inside JSON is ordinary user data and is unrelated to that internal
 database ID.
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8080/objects `
+curl.exe -X POST http://127.0.0.1:8080/databases/users `
   -H "Content-Type: application/json" `
   --data '{"id":"app-user-9","username":"ada","email":"ada@example.test","friends":[12,18]}'
-curl.exe http://127.0.0.1:8080/objects/0
+curl.exe http://127.0.0.1:8080/databases/users/0
 ```
 
-The operations are `POST /objects`, `GET /objects/{id}`, `PUT /objects/{id}`,
-`DELETE /objects/{id}`, and `POST /objects/query`. For example:
+Database object routes use the database path directly:
+`GET /databases/{name}` lists IDs, `POST /databases/{name}` creates an object,
+`GET|PUT|DELETE /databases/{name}/{id}` operate on one object,
+`POST /databases/{name}/query` searches by property, and
+`GET /databases/{name}/info` returns database metadata.
+`POST /databases/{name}/batch` applies related changes atomically within that
+database. Deleting the `/databases/{name}` path archives or purges that
+database. Listing IDs and
+query results support `limit` and `offset` pagination; use `after_id` cursors
+for stable message timeline pages. For example:
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8080/objects/query `
+curl.exe -X POST "http://127.0.0.1:8080/databases/users/query?limit=20&offset=0" `
   -H "Content-Type: application/json" `
   --data '{"field":"email","equals":"ada@example.test"}'
 ```
@@ -64,11 +91,16 @@ languages.
 ## Data files and performance
 
 For database name `users`, the directory contains a metadata file
-`users.manifest.json` and bounded append-only segment files such as
-`users.segment-00000000.minidb`. The manifest records the segment list, size
-limit, and next ID. When the active segment cannot fit the next record, the
-storage creates a new segment and updates the manifest. The selected size limit
-must be the same each time the database is opened.
+`data/users/users.manifest.json` and bounded append-only segment files such as
+`data/users/users.segment-00000000.minidb`. The manifest records the segment
+list, size limit, and next ID. When the active segment cannot fit the next
+record, the storage creates a new segment and updates the manifest. The
+selected size limit must be the same each time the database is opened.
+
+Deleting a database without a query option moves it into `data/.archive/`;
+`POST /databases/{name}/restore` brings it back. Use
+`DELETE /databases/{name}?purge=true` only when you explicitly want to
+permanently remove its files.
 
 The core uses hash maps for ID lookup and exact top-level field/value lookup,
 both average O(1) relative to the number of indexed keys. Updating an object
@@ -78,10 +110,10 @@ O(k) to return k objects. Listing all IDs sorts them and takes O(n log n).
 Indexing every property uses additional memory and write work proportional to
 the number and size of the object's top-level fields.
 
-The `ObjectStorage` boundary separates the database behavior from its
-multi-file implementation, leaving room for later storage strategies.
-Compaction is not implemented, so segments do not shrink after deletes or
-updates and the data directory grows over time.
+The `ObjectStorage` boundary separates database behavior from its multi-file
+implementation, leaving room for later storage strategies. Compaction is not
+implemented, so segments do not shrink after deletes or updates and the data
+directory grows over time.
 
 ## Project structure and guides
 
@@ -102,7 +134,11 @@ data/                Local database files (ignored by Git)
 - [Roadmap](docs/roadmap.md): future work.
 
 The server listens only on `127.0.0.1`. Authentication, authorization, and TLS
-are not implemented; do not expose it to a network.
+are not implemented; do not expose it to a network. Cross-origin browser
+writes are rejected, and an operating-system lock prevents two server
+processes from opening the same data directory simultaneously. See the
+[chat-workload readiness roadmap](docs/roadmap.md) for the important limits
+before using MiniDB behind a real chat application.
 
 ## AI assistance
 

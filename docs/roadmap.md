@@ -1,49 +1,43 @@
-# Suggested Learning Roadmap
+# Chat-Workload Readiness
 
-This roadmap suggests small, testable directions for growing MiniDB. It is not
-a commitment that every item will be implemented.
+MiniDB can serve as a local persistence component for a chat prototype, but it
+is not a complete or production-ready chat database/service.
 
-## 1. Complete the object API
+## Available foundations
 
-Add field-level access, batch operations, pagination for ID and query results,
-API versioning, compound/range queries, and consistent error codes. Keep
-clients independent of implementation details and add integration tests for
-every endpoint and status.
+- Separate databases can hold users, conversations, membership records, and
+  messages, each with independent IDs and storage directories.
+- Message objects can be queried by exact top-level values such as
+  `conversation_id`; ordered ID cursors support fetching older messages.
+- A single database batch can atomically create messages, update a conversation
+  summary, and update related objects in that same database.
+- Appends are bounded by segment size, recover incomplete trailing records,
+  and preserve complete operations across restart.
+- Object and query endpoints are paginated; JSON depth and request size are
+  bounded.
 
-## 2. Improve segmented storage
+## Required before production
 
-`ObjectStorage` separates object behavior from persistence;
-`SegmentedStorage` currently manages one manifest and multiple bounded
-append-only files. Future work includes crash-safe compaction, rotation policy,
-cross-process locking, and broader recovery tests before using it for larger
-databases.
+1. **Security and tenancy:** authenticated identities, authorization for every
+   conversation/member/message, encrypted transport, secret management, audit
+   policy, and abuse/rate controls belong in a trusted application service.
+   The current server binds to loopback and has no authentication or TLS.
+2. **Growth and durability:** implement and fault-test crash-safe compaction,
+   checksums, automated consistent backups, restore drills, disk-full handling,
+   and migration tools for the older prototype formats. The current append-only
+   files grow indefinitely and live objects/indexes all reside in memory.
+3. **Scale and availability:** define supported database sizes and workload
+   limits; benchmark representative message read/write patterns; add metrics,
+   operational alerts, and a tested replication/failover plan if availability
+   requires it. Only one process may open a data root.
+4. **Chat semantics:** the API does not provide WebSockets, publish/subscribe,
+   delivery acknowledgements, unread counters, membership enforcement,
+   full-text search, timestamp/range queries, or transactions across separate
+   databases. Implement these in an application service or extend MiniDB with
+   explicit contracts and tests.
+5. **Verification:** add fuzzing for record/JSON parsing, failure-injection
+   storage tests, and CI coverage on supported operating systems and compilers.
 
-## 3. Improve record integrity and migrations
-
-Add checksums and an explicit format migration policy. Test interrupted writes,
-corrupted records, and supported older versions without relying on
-timing-sensitive tests.
-
-## 4. Define multi-key operations
-
-Design atomic batches or transactions before implementing them. Specify what
-clients observe when any part of a batch fails and test both memory and disk
-state.
-
-## 5. Harden the HTTP service
-
-Before any non-local deployment, design authentication, authorization,
-transport security, request timeouts, rate limits, and resource limits. Keep
-loopback-only binding as the safe default.
-
-## 6. Measure before optimizing
-
-Add reproducible benchmarks for expected workloads before replacing the
-container or storage format. Use measurements to guide indexing, caching, or
-more advanced storage structures.
-
-## 7. Consider broader tooling
-
-As the project grows, consider CI builds on multiple compilers, sanitizers,
-format checks, fuzz tests for the binary reader, and documented release and
-compatibility policies.
+Avoid claiming production readiness until the deployment-specific security,
+durability, performance, recovery, and restore requirements have measurable
+acceptance criteria and pass them.

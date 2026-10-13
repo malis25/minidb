@@ -47,7 +47,7 @@ do not put source files or user database files there.
 ```powershell
 .\build\Debug\minidb.exe --help
 .\build\Debug\minidb.exe --version
-.\build\Debug\minidb.exe --db-dir data --db-file users --max-file-size 67108864
+.\build\Debug\minidb.exe --db-dir data --max-file-size 67108864
 ```
 
 Open the repository root in Visual Studio Code. CMake Tools configures the
@@ -103,27 +103,31 @@ property inside `user` is not interpreted as the database ID. `get` returns an
 immutable shared object or an empty pointer when the ID is missing. The
 default-constructed database above is in-memory only. To persist objects,
 construct it with `std::make_unique<minidb::SegmentedStorage>(directory,
-database_name, max_segment_bytes)`. The server reads these settings from the
-required `--db-dir`, `--db-file`, and `--max-file-size` arguments.
+database_name, max_segment_bytes)`. The server reads these settings from the required `--db-dir` and
+`--max-file-size` arguments. Databases are created by `POST /databases`.
 
 ## Run the HTTP server
 
 ```powershell
-.\build\Debug\minidb.exe --port 8080 --db-dir data --db-file sample --max-file-size 67108864
+.\build\Debug\minidb.exe --port 8080 --db-dir data --max-file-size 67108864
 ```
 
-The server provides `GET /health`, `GET /objects`, `POST /objects`,
-`GET /objects/{id}`, `PUT /objects/{id}`, `DELETE /objects/{id}`, and
-`POST /objects/query`. Create returns the database-generated numeric ID.
-`PUT` requires a complete JSON object and replaces the object at that ID.
-Queries use `{"field":"email","equals":"..."}` and match top-level fields.
-The server binds to `127.0.0.1`.
+The server provides database lifecycle endpoints under `/databases` and
+database-scoped object endpoints directly under `/databases/{name}`. Create a
+database using `POST /databases` with `{"name":"users"}` before using its object
+API. `GET /databases/{name}` lists IDs, `POST /databases/{name}` creates an
+object, `GET /databases/{name}/info` returns database metadata, and
+`POST /databases/{name}/query` searches object properties. IDs are independent
+per database. ID lists and equality queries accept
+`limit` and `offset` query parameters (default page size 100, maximum 1000).
+Deleting a database archives its files by default; use `?purge=true` only for
+permanent removal. The server binds to `127.0.0.1`.
 
 Use a separate temporary data directory when manually exercising the API:
 
 ```powershell
 .\build\Debug\minidb.exe --port 8080 `
-    --db-dir $env:TEMP\minidb-http-data --db-file test --max-file-size 67108864
+    --db-dir $env:TEMP\minidb-http-data --max-file-size 67108864
 ```
 
 Request logs are opt-in with `--log-requests`; `--log-details` also prints
@@ -135,9 +139,10 @@ Persistence tests must not create files in the source tree. Tests create
 unique directories under `std::filesystem::temp_directory_path()` and remove
 them after each test. Follow that pattern for tests that read or write files.
 
-User-created databases can be stored under `data/`; the server creates this
-directory if it does not exist. `/data/`, `*.minidb`, and temporary record files
-are ignored by Git. Never use real user data as test input.
+User-created databases have separate subdirectories under `data/`; the server
+creates the root directory if it does not exist. Archived databases live under
+`data/.archive/`. These files are ignored by Git. Never use real user data as
+test input.
 
 ## Error handling
 

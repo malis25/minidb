@@ -10,6 +10,8 @@
 
 namespace minidb {
 
+[[nodiscard]] bool is_valid_database_name(std::string_view name) noexcept;
+
 struct StoredObject {
     std::uint64_t id = 0;
     Object object;
@@ -20,6 +22,14 @@ struct StorageSnapshot {
     std::uint64_t next_id = 0;
 };
 
+enum class StorageMutationType { store, erase };
+
+struct StorageMutation {
+    StorageMutationType type = StorageMutationType::store;
+    std::uint64_t id = 0;
+    Object object;
+};
+
 // Database uses this boundary without depending on filenames or segment layout.
 class ObjectStorage {
   public:
@@ -28,6 +38,8 @@ class ObjectStorage {
     [[nodiscard]] virtual StorageSnapshot load() = 0;
     virtual void store(std::uint64_t id, const Object& object, std::uint64_t next_id) = 0;
     virtual void erase(std::uint64_t id) = 0;
+    virtual void apply_batch(const std::vector<StorageMutation>& mutations,
+                             std::uint64_t next_id) = 0;
 };
 
 // The current backend stores metadata in one manifest and records in bounded
@@ -40,12 +52,14 @@ class SegmentedStorage final : public ObjectStorage {
     [[nodiscard]] StorageSnapshot load() override;
     void store(std::uint64_t id, const Object& object, std::uint64_t next_id) override;
     void erase(std::uint64_t id) override;
+    void apply_batch(const std::vector<StorageMutation>& mutations, std::uint64_t next_id) override;
 
     [[nodiscard]] const std::filesystem::path& manifest_path() const noexcept;
 
   private:
     void append_record(char operation, std::uint64_t id, const Object* object,
                        std::uint64_t next_id);
+    void append_payload(std::string record, std::uint64_t next_id, bool update_next_id);
     void save_manifest();
     void create_segment(const std::string& filename);
 

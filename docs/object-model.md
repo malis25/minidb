@@ -26,6 +26,9 @@ number, boolean, null, array, or nested object:
 }
 ```
 
+Objects may be nested up to 128 levels. The same limit applies to arrays and
+objects inside stored property values.
+
 The object's `"id"` field above is ordinary application data. It is not the
 database ID. If this object is created when the database next ID is `0`, the
 database key is `0`, while the field value remains `"app-user-9"`.
@@ -106,7 +109,10 @@ The ID map and exact-value indexes are `std::unordered_map` structures:
   with `p` top-level properties, plus the value serialization costs.
 - Indexed equality lookup: average O(1) to find a posting set, then O(k) to
   return the `k` matching objects.
-- ID listing and result ordering: O(n log n) or O(k log k), respectively.
+- Full ID listing and unpaged result ordering: O(n log n) or O(k log k),
+  respectively. Paginated HTTP listing selects the requested prefix with
+  expected O(n) selection plus sorting of that prefix, while still collecting
+  all IDs in temporary memory.
 - Index maintenance: O(p) index updates per write, where `p` is the number of
   top-level properties, plus the cost to serialize indexed values.
 

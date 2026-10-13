@@ -3,6 +3,7 @@
 add_library(minidb_server
     server.cpp
     server_options.cpp
+    database_catalog.cpp
     database_api.cpp
     request_logging.cpp
 )
