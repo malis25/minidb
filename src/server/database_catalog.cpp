@@ -228,6 +228,24 @@ DatabaseCatalog::RemoveResult DatabaseCatalog::remove(const std::string& name, b
     const auto active_directory = root_directory_ / name;
     const auto managed_database = database->second;
     std::lock_guard database_lock(managed_database->mutex);
+
+    std::filesystem::path archive_directory;
+    if (!purge) {
+        archive_directory = archive_directory_ / name;
+        if (archived_databases_.contains(name) || std::filesystem::exists(archive_directory)) {
+            return RemoveResult::archive_exists;
+        }
+        std::filesystem::create_directories(archive_directory_);
+        if (!archived_databases_.emplace(name, archive_directory).second) {
+            return RemoveResult::archive_exists;
+        }
+    }
+
+    // Close any open index files before moving or deleting the directory:
+    // Windows refuses to rename or remove a directory that still has open files.
+    managed_database->active = false;
+    managed_database->database.close();
+
     if (purge) {
         std::error_code error;
         std::filesystem::remove_all(active_directory, error);
@@ -235,23 +253,13 @@ DatabaseCatalog::RemoveResult DatabaseCatalog::remove(const std::string& name, b
             throw std::system_error(error, "Could not permanently remove database: " + name);
         }
     } else {
-        const auto archive_directory = archive_directory_ / name;
-        if (archived_databases_.contains(name) || std::filesystem::exists(archive_directory)) {
-            return RemoveResult::archive_exists;
-        }
-        std::filesystem::create_directories(archive_directory_);
-        const auto [archive_entry, inserted] = archived_databases_.emplace(name, archive_directory);
-        if (!inserted) {
-            return RemoveResult::archive_exists;
-        }
         std::error_code error;
         std::filesystem::rename(active_directory, archive_directory, error);
         if (error) {
-            archived_databases_.erase(archive_entry);
+            archived_databases_.erase(name);
             throw std::system_error(error, "Could not archive database: " + name);
         }
     }
-    managed_database->active = false;
     active_databases_.erase(database);
     return RemoveResult::removed;
 }

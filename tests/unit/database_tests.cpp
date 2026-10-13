@@ -692,3 +692,20 @@ TEST(DiskBackedStorageTests, CreatesIndexesAtRuntime) {
     EXPECT_TRUE(database.indexed_fields().empty());
     EXPECT_EQ(database.find("email", "ada@example.test").size(), 1U);
 }
+
+TEST(DiskBackedStorageTests, ReplacesDropStaleIndexEntriesAfterReopen) {
+    TemporaryDirectory directory;
+    {
+        minidb::Database database{make_disk_storage(directory.path(), {"email"}, 0)};
+        static_cast<void>(database.create({{"email", "old@example.test"}}));
+        database.set(0, {{"email", "new@example.test"}});
+    }
+
+    auto reopened = make_disk_storage(directory.path(), {}, 0);
+    static_cast<void>(reopened->load());
+    const auto old_value = minidb::Object{{"email", "old@example.test"}}.at("email").dump();
+    const auto new_value = minidb::Object{{"email", "new@example.test"}}.at("email").dump();
+    EXPECT_TRUE(reopened->query_index("email", old_value).empty());
+    ASSERT_EQ(reopened->query_index("email", new_value).size(), 1U);
+    EXPECT_EQ(reopened->query_index("email", new_value).front(), 0U);
+}

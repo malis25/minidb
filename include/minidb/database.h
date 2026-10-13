@@ -68,6 +68,10 @@ class Database {
     void drop_index(std::string_view field);
     [[nodiscard]] bool disk_backed() const noexcept;
 
+    // Releases storage resources (open index files). The database must not be
+    // used afterwards.
+    void close();
+
     [[nodiscard]] std::shared_ptr<const Object> get(std::uint64_t id) const;
     [[nodiscard]] bool remove(std::uint64_t id);
     [[nodiscard]] bool contains(std::uint64_t id) const;

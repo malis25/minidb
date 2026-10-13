@@ -246,6 +246,12 @@ bool Database::disk_backed() const noexcept {
     return storage_ && storage_->is_disk_backed();
 }
 
+void Database::close() {
+    if (storage_) {
+        storage_->close();
+    }
+}
+
 std::vector<std::string> Database::indexed_fields() const {
     return storage_ ? storage_->indexed_fields() : std::vector<std::string>{};
 }

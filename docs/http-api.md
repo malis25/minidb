@@ -95,7 +95,7 @@ Content-Type: application/json
 Response:
 
 ```json
-{"created":true,"name":"users"}
+{"created":true,"disk_backed":true,"indexed_fields":["username"],"name":"users"}
 ```
 
 The schema supports `string`, `integer`, `number`, `boolean`, `null`, `object`,
@@ -145,10 +145,11 @@ validated against the current schema before any data is written.
 
 ### `GET /databases/{name}/info`
 
-Returns the active database name, live object count, and next ID:
+Returns the active database name, live object count, next ID, whether the
+database is disk-backed, and its indexed fields:
 
 ```json
-{"name":"users","object_count":3,"next_id":4}
+{"name":"users","object_count":3,"next_id":4,"disk_backed":false,"indexed_fields":[]}
 ```
 
 Unknown database names return HTTP 404.

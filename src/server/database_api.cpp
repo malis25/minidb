@@ -478,13 +478,17 @@ void DatabaseApi::register_routes(httplib::Server& server) {
             }
             const auto maximum_objects_per_segment =
                 body["maximum_objects_per_segment"].get<std::uint64_t>();
-            if (!catalog_.create(name, schema, maximum_objects_per_segment, std::move(indexed_fields),
+            if (!catalog_.create(name, schema, maximum_objects_per_segment, indexed_fields,
                                  cache_bytes)) {
                 send_error(response, "Database already exists: " + name,
                            httplib::StatusCode::Conflict_409);
                 return;
             }
-            send_json(response, {{"name", name}, {"created", true}},
+            send_json(response,
+                      {{"name", name},
+                       {"created", true},
+                       {"indexed_fields", indexed_fields},
+                       {"disk_backed", !indexed_fields.empty() || cache_bytes > 0}},
                       httplib::StatusCode::Created_201);
         } catch (const std::invalid_argument& error) {
             send_error(response, error.what(), httplib::StatusCode::BadRequest_400);
@@ -638,7 +642,9 @@ void DatabaseApi::register_routes(httplib::Server& server) {
                    send_json(response,
                              {{"name", name},
                               {"object_count", database->database.size()},
-                              {"next_id", database->database.next_id()}},
+                              {"next_id", database->database.next_id()},
+                              {"disk_backed", database->database.disk_backed()},
+                              {"indexed_fields", database->database.indexed_fields()}},
                              httplib::StatusCode::OK_200);
                });
 

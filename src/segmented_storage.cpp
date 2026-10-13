@@ -725,10 +725,12 @@ StorageSnapshot SegmentedStorage::load() {
                 if (stored_ids.insert(id).second) {
                     ++recovered_object_count;
                 }
-                object_locations_[id] = ObjectLocation{index, payload_offset, object_size};
                 if (disk_backed_) {
-                    insert_into_indexes(id, object);
+                    // record_store evicts the previous version's index entries, so a
+                    // replaced object never leaves stale keys behind in the tree.
+                    record_store(index, payload_offset, object_size, id, object);
                 } else {
+                    object_locations_[id] = ObjectLocation{index, payload_offset, object_size};
                     objects.insert_or_assign(id, std::move(object));
                 }
             } else if (operation == erase_operation) {
@@ -782,13 +784,13 @@ StorageSnapshot SegmentedStorage::load() {
                         if (stored_ids.insert(mutation_id).second) {
                             ++recovered_object_count;
                         }
-                        object_locations_[mutation_id] =
-                            ObjectLocation{index, payload_offset, object_size};
                         if (disk_backed_) {
-                            insert_into_indexes(mutation_id, object);
+                            record_store(index, payload_offset, object_size, mutation_id, object);
                             mutations.push_back(
                                 {StorageMutationType::store, mutation_id, {}});
                         } else {
+                            object_locations_[mutation_id] =
+                                ObjectLocation{index, payload_offset, object_size};
                             mutations.push_back(
                                 {StorageMutationType::store, mutation_id, std::move(object)});
                         }
@@ -1134,6 +1136,15 @@ void SegmentedStorage::update_schema(const ObjectSchema& schema) {
         schema_ = previous_schema;
         throw;
     }
+}
+
+void SegmentedStorage::close() {
+    // Dropping the trees closes their files. Leaving them open would prevent the
+    // database directory from being renamed or removed on Windows.
+    index_trees_.clear();
+    cache_order_.clear();
+    cache_index_.clear();
+    cached_bytes_ = 0;
 }
 
 void SegmentedStorage::create_segment(const std::string& filename) {

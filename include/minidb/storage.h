@@ -53,6 +53,12 @@ class ObjectStorage {
                              std::uint64_t next_id) = 0;
     virtual void update_schema(const ObjectSchema& schema) = 0;
 
+    // Releases any on-disk resources the backend holds open (for example index
+    // files). Callers must do this before moving or deleting the database
+    // directory, because some platforms refuse to rename a directory that still
+    // has open files. The backend must not be used afterwards.
+    virtual void close() {}
+
     [[nodiscard]] virtual bool is_disk_backed() const noexcept {
         return false;
     }
@@ -102,6 +108,7 @@ class SegmentedStorage final : public ObjectStorage {
     void erase(std::uint64_t id) override;
     void apply_batch(const std::vector<StorageMutation>& mutations, std::uint64_t next_id) override;
     void update_schema(const ObjectSchema& schema) override;
+    void close() override;
 
     [[nodiscard]] bool is_disk_backed() const noexcept override;
     [[nodiscard]] std::shared_ptr<const Object> read(std::uint64_t id) override;

@@ -327,6 +327,43 @@ TEST_F(DatabaseApiTests, ArchivesRestoresAndPurgesDatabasesOnRequest) {
     EXPECT_FALSE(std::filesystem::exists(temporary_directory_.path() / "users"));
 }
 
+TEST_F(DatabaseApiTests, ArchivesRestoresAndPurgesDiskBackedDatabases) {
+    // Regression test: a disk-backed database keeps its index files open, and an
+    // open file inside the directory used to make the archive rename fail on
+    // Windows (HTTP 500).
+    auto creation = database_creation("indexed");
+    creation["indexed_fields"] = {"username"};
+    const auto created = client_->Post("/databases", creation.dump(), "application/json");
+    ASSERT_TRUE(created) << httplib::to_string(created.error());
+    ASSERT_EQ(created->status, httplib::StatusCode::Created_201);
+
+    const auto ada =
+        client_->Post("/databases/indexed", R"({"username":"ada"})", "application/json");
+    ASSERT_TRUE(ada);
+    ASSERT_EQ(ada->status, httplib::StatusCode::Created_201);
+
+    const auto archived = client_->Delete("/databases/indexed");
+    ASSERT_TRUE(archived);
+    EXPECT_EQ(archived->status, httplib::StatusCode::OK_200);
+    EXPECT_FALSE(std::filesystem::exists(temporary_directory_.path() / "indexed"));
+    EXPECT_TRUE(std::filesystem::exists(temporary_directory_.path() / ".archive" / "indexed"));
+
+    const auto restored = client_->Post("/databases/indexed/restore", "", "application/json");
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->status, httplib::StatusCode::OK_200);
+
+    const auto query = client_->Post("/databases/indexed/query?limit=10",
+                                     R"({"field":"username","equals":"ada"})", "application/json");
+    ASSERT_TRUE(query);
+    ASSERT_EQ(query->status, httplib::StatusCode::OK_200);
+    EXPECT_EQ(nlohmann::json::parse(query->body)["count"], 1);
+
+    const auto purged = client_->Delete("/databases/indexed?purge=true");
+    ASSERT_TRUE(purged);
+    EXPECT_EQ(purged->status, httplib::StatusCode::OK_200);
+    EXPECT_FALSE(std::filesystem::exists(temporary_directory_.path() / "indexed"));
+}
+
 TEST_F(DatabaseApiTests, RejectsInvalidDatabaseNamesAndDuplicateCreation) {
     const auto invalid =
         client_->Post("/databases", database_creation("../users").dump(), "application/json");
@@ -617,7 +654,17 @@ TEST_F(DatabaseApiTests, CreatesIndexedDatabasesAndServesIndexEndpoints) {
     const auto created =
         client_->Post("/databases", creation.dump(), "application/json");
     ASSERT_TRUE(created) << httplib::to_string(created.error());
-    EXPECT_EQ(created->status, httplib::StatusCode::Created_201);
+    ASSERT_EQ(created->status, httplib::StatusCode::Created_201);
+    const auto created_body = nlohmann::json::parse(created->body);
+    EXPECT_EQ(created_body["indexed_fields"], (nlohmann::json{"username"}));
+    EXPECT_TRUE(created_body["disk_backed"]);
+
+    const auto info = client_->Get("/databases/indexed/info");
+    ASSERT_TRUE(info);
+    ASSERT_EQ(info->status, httplib::StatusCode::OK_200);
+    const auto info_body = nlohmann::json::parse(info->body);
+    EXPECT_TRUE(info_body["disk_backed"]);
+    EXPECT_EQ(info_body["indexed_fields"], (nlohmann::json{"username"}));
 
     const auto initial = client_->Get("/databases/indexed/indexes");
     ASSERT_TRUE(initial);
