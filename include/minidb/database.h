@@ -62,6 +62,12 @@ class Database {
     [[nodiscard]] const ObjectSchema& schema() const noexcept;
     [[nodiscard]] std::uint64_t maximum_objects_per_segment() const noexcept;
 
+    // On-disk field indexes. These are no-ops for purely in-memory databases.
+    [[nodiscard]] std::vector<std::string> indexed_fields() const;
+    void create_index(std::string_view field);
+    void drop_index(std::string_view field);
+    [[nodiscard]] bool disk_backed() const noexcept;
+
     [[nodiscard]] std::shared_ptr<const Object> get(std::uint64_t id) const;
     [[nodiscard]] bool remove(std::uint64_t id);
     [[nodiscard]] bool contains(std::uint64_t id) const;

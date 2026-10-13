@@ -127,4 +127,6 @@ The ID map and exact-value indexes are `std::unordered_map` structures:
 
 Indexing every property makes common equality queries fast without requiring
 the caller to declare indexes, but increases RAM usage and write cost. The
-current database keeps every live object in memory, in addition to the index.
+default database keeps every live object in memory, in addition to the index.
+Disk-backed databases instead keep a bounded object cache and read bodies from
+segments on demand.

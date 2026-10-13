@@ -610,6 +610,72 @@ TEST_F(DatabaseApiTests, RejectsMalformedPropertyQueries) {
     EXPECT_EQ(malformed_json->status, httplib::StatusCode::BadRequest_400);
 }
 
+TEST_F(DatabaseApiTests, CreatesIndexedDatabasesAndServesIndexEndpoints) {
+    auto creation = database_creation("indexed");
+    creation["indexed_fields"] = {"username"};
+    creation["cache_bytes"] = 4096;
+    const auto created =
+        client_->Post("/databases", creation.dump(), "application/json");
+    ASSERT_TRUE(created) << httplib::to_string(created.error());
+    EXPECT_EQ(created->status, httplib::StatusCode::Created_201);
+
+    const auto initial = client_->Get("/databases/indexed/indexes");
+    ASSERT_TRUE(initial);
+    EXPECT_EQ(initial->status, httplib::StatusCode::OK_200);
+    EXPECT_EQ(nlohmann::json::parse(initial->body)["indexed_fields"],
+              (nlohmann::json{"username"}));
+
+    const auto ada = client_->Post("/databases/indexed", R"({"username":"ada"})",
+                                   "application/json");
+    ASSERT_TRUE(ada) << httplib::to_string(ada.error());
+    EXPECT_EQ(ada->status, httplib::StatusCode::Created_201);
+
+    const auto matches = client_->Post("/databases/indexed/query", R"({"field":"username","equals":"ada"})",
+                                       "application/json");
+    ASSERT_TRUE(matches);
+    ASSERT_EQ(matches->status, httplib::StatusCode::OK_200);
+    const auto matches_body = nlohmann::json::parse(matches->body);
+    ASSERT_EQ(matches_body["total"], 1);
+    EXPECT_EQ(matches_body["results"][0]["object"]["username"], "ada");
+
+    const auto updated = client_->Put("/databases/indexed/indexes",
+                                      R"({"indexed_fields":["username","email"]})",
+                                      "application/json");
+    ASSERT_TRUE(updated);
+    ASSERT_EQ(updated->status, httplib::StatusCode::OK_200);
+    EXPECT_EQ(nlohmann::json::parse(updated->body)["indexed_fields"],
+              (nlohmann::json{"username", "email"}));
+
+    const auto cleared = client_->Put("/databases/indexed/indexes", R"({"indexed_fields":[]})",
+                                      "application/json");
+    ASSERT_TRUE(cleared);
+    ASSERT_EQ(cleared->status, httplib::StatusCode::OK_200);
+    EXPECT_EQ(nlohmann::json::parse(cleared->body)["indexed_fields"], nlohmann::json::array());
+}
+
+TEST_F(DatabaseApiTests, RejectsMalformedIndexRequests) {
+    const auto missing = client_->Put("/databases/users/indexes", R"({})", "application/json");
+    ASSERT_TRUE(missing);
+    EXPECT_EQ(missing->status, httplib::StatusCode::BadRequest_400);
+
+    const auto not_array = client_->Put("/databases/users/indexes", R"({"indexed_fields":"name"})",
+                                        "application/json");
+    ASSERT_TRUE(not_array);
+    EXPECT_EQ(not_array->status, httplib::StatusCode::BadRequest_400);
+
+    const auto empty_field =
+        client_->Put("/databases/users/indexes", R"({"indexed_fields":[""]})", "application/json");
+    ASSERT_TRUE(empty_field);
+    EXPECT_EQ(empty_field->status, httplib::StatusCode::BadRequest_400);
+
+    auto bad_creation = database_creation("bad");
+    bad_creation["indexed_fields"] = "name";
+    const auto bad_create =
+        client_->Post("/databases", bad_creation.dump(), "application/json");
+    ASSERT_TRUE(bad_create);
+    EXPECT_EQ(bad_create->status, httplib::StatusCode::BadRequest_400);
+}
+
 TEST(ServerOptionsTests, ParsesDatabaseDirectoryWithoutStorageSizingOption) {
     char program[] = "minidb";
     char directory_flag[] = "--db-dir";

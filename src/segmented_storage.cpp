@@ -22,31 +22,76 @@ namespace minidb {
 
 namespace {
 
-constexpr std::array<char, 8> legacy_segment_signature{'M', 'I', 'N', 'I', 'D', 'B', '2', '\0'};
 constexpr std::array<char, 8> segment_signature{'M', 'I', 'N', 'I', 'D', 'B', '3', '\0'};
-constexpr std::string_view legacy_manifest_format = "MINIDB-MANIFEST-1";
-constexpr std::string_view batch_manifest_format = "MINIDB-MANIFEST-2";
-constexpr std::string_view manifest_format = "MINIDB-MANIFEST-3";
+constexpr std::string_view manifest_format = "MINIDB-MANIFEST-4";
 constexpr char store_operation = 'S';
 constexpr char erase_operation = 'E';
 constexpr char batch_operation = 'T';
-constexpr std::uint64_t legacy_header_size = legacy_segment_signature.size();
 constexpr std::uint64_t header_slot_size = 3 * sizeof(std::uint64_t);
 constexpr std::uint64_t header_size = segment_signature.size() + 2 * header_slot_size;
 constexpr std::uint64_t header_checksum_salt = 0x4d494e4944423300ULL;
-constexpr std::uint64_t legacy_default_objects_per_segment = 10000;
+constexpr std::uint64_t default_objects_per_segment = 10000;
 constexpr std::uint64_t record_length_size = sizeof(std::uint64_t);
 constexpr std::uint64_t record_prefix_size = 1 + sizeof(std::uint64_t);
 
-struct SegmentHeader {
-    bool current_format = false;
-    std::uint64_t generation = 0;
-    std::uint64_t object_count = 0;
-    std::uint64_t bytes = 0;
-};
-
 std::uint64_t header_checksum(std::uint64_t generation, std::uint64_t object_count) {
     return header_checksum_salt ^ generation ^ object_count;
+}
+
+std::uint64_t field_value_hash(std::string_view value) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto byte : value) {
+        hash ^= static_cast<unsigned char>(byte);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void append_big_endian(std::string& output, std::uint64_t value) {
+    for (unsigned int shift = 0; shift < 64; shift += 8) {
+        output.push_back(static_cast<char>((value >> (56 - shift)) & 0xff));
+    }
+}
+
+std::string make_index_key(std::string_view value, std::uint64_t id) {
+    std::string key;
+    key.reserve(16);
+    append_big_endian(key, field_value_hash(value));
+    append_big_endian(key, id);
+    return key;
+}
+
+std::string make_index_prefix(std::string_view value) {
+    std::string prefix;
+    prefix.reserve(8);
+    append_big_endian(prefix, field_value_hash(value));
+    return prefix;
+}
+
+std::uint64_t read_index_id(std::string_view key) {
+    std::uint64_t id = 0;
+    for (std::size_t index = 8; index < 16; ++index) {
+        id = (id << 8) | static_cast<unsigned char>(key[index]);
+    }
+    return id;
+}
+
+std::string index_file_component(std::string_view field) {
+    std::ostringstream output;
+    output << std::hex << std::setw(16) << std::setfill('0') << field_value_hash(field);
+    return output.str();
+}
+
+void require_valid_indexed_fields(const std::vector<std::string>& fields) {
+    std::unordered_set<std::string> seen;
+    for (const auto& field : fields) {
+        if (field.empty()) {
+            throw std::invalid_argument("Indexed field names cannot be empty.");
+        }
+        if (!seen.insert(field).second) {
+            throw std::invalid_argument("Indexed field names must be unique.");
+        }
+    }
 }
 
 bool path_exists_without_following_symlinks(const std::filesystem::path& path) {
@@ -166,17 +211,21 @@ bool is_valid_database_name(std::string_view name) noexcept {
 }
 
 SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string database_name,
-                                   std::uint64_t maximum_objects_per_segment, ObjectSchema schema)
+                                   std::uint64_t maximum_objects_per_segment, ObjectSchema schema,
+                                   std::vector<std::string> indexed_fields,
+                                   std::uint64_t cache_bytes)
     : directory_(std::move(directory)), database_name_(std::move(database_name)),
-      maximum_objects_per_segment_(maximum_objects_per_segment), schema_(std::move(schema)) {
+      maximum_objects_per_segment_(maximum_objects_per_segment), schema_(std::move(schema)),
+      indexed_fields_(std::move(indexed_fields)), cache_bytes_(cache_bytes) {
     if (directory_.empty()) {
         throw std::invalid_argument("Database directory cannot be empty.");
     }
     if (!is_valid_database_name(database_name_)) {
         throw std::invalid_argument("Invalid database name.");
     }
+    require_valid_indexed_fields(indexed_fields_);
     if (maximum_objects_per_segment_ == 0) {
-        maximum_objects_per_segment_ = legacy_default_objects_per_segment;
+        maximum_objects_per_segment_ = default_objects_per_segment;
     }
     if (!schema_.is_null()) {
         std::string schema_error;
@@ -185,6 +234,240 @@ SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string 
         }
     }
     manifest_path_ = directory_ / (database_name_ + ".manifest.json");
+}
+
+bool SegmentedStorage::is_disk_backed() const noexcept {
+    return disk_backed_;
+}
+
+std::uint64_t SegmentedStorage::cache_bytes() const noexcept {
+    return cache_bytes_;
+}
+
+std::vector<std::string> SegmentedStorage::indexed_fields() const {
+    return indexed_fields_;
+}
+
+std::filesystem::path SegmentedStorage::index_path(std::string_view field) const {
+    return directory_ / (database_name_ + ".index-" + index_file_component(field) + ".tree");
+}
+
+std::shared_ptr<const Object> SegmentedStorage::object_at(const ObjectLocation& location) const {
+    if (location.segment_index >= segment_files_.size()) {
+        throw std::runtime_error("Object location references a missing segment.");
+    }
+    const auto segment_path = directory_ / segment_files_[location.segment_index];
+    std::ifstream input(segment_path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Could not open database segment: " + segment_path.string());
+    }
+    input.seekg(static_cast<std::streamoff>(location.payload_offset), std::ios::beg);
+    if (!input) {
+        throw std::runtime_error("Could not seek to a stored object: " + segment_path.string());
+    }
+    std::string payload(static_cast<std::size_t>(location.payload_size), '\0');
+    input.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+    if (!input) {
+        throw std::runtime_error("Could not read a stored object: " + segment_path.string());
+    }
+    auto object = Object::parse(payload, [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+        if (depth > maximum_object_nesting_depth) {
+            throw std::length_error("Stored JSON nesting exceeds the maximum depth of 128.");
+        }
+        return true;
+    });
+    if (!object.is_object()) {
+        throw std::runtime_error("Stored record does not contain a JSON object.");
+    }
+    return std::make_shared<const Object>(std::move(object));
+}
+
+void SegmentedStorage::insert_into_indexes(std::uint64_t id, const Object& object) {
+    if (index_trees_.empty()) {
+        return;
+    }
+    for (const auto& field : indexed_fields_) {
+        const auto entry = object.find(field);
+        if (entry == object.end()) {
+            continue;
+        }
+        const auto tree = index_trees_.find(field);
+        if (tree == index_trees_.end()) {
+            continue;
+        }
+        tree->second->put(make_index_key(entry->dump(), id), std::string_view{});
+    }
+}
+
+void SegmentedStorage::remove_from_indexes(std::uint64_t id, const Object& object) {
+    if (index_trees_.empty()) {
+        return;
+    }
+    for (const auto& field : indexed_fields_) {
+        const auto entry = object.find(field);
+        if (entry == object.end()) {
+            continue;
+        }
+        const auto tree = index_trees_.find(field);
+        if (tree == index_trees_.end()) {
+            continue;
+        }
+        static_cast<void>(tree->second->remove(make_index_key(entry->dump(), id)));
+    }
+}
+
+void SegmentedStorage::drop_cached(std::uint64_t id) {
+    const auto cached = cache_index_.find(id);
+    if (cached == cache_index_.end()) {
+        return;
+    }
+    cached_bytes_ -= cached->second->second->dump().size();
+    cache_order_.erase(cached->second);
+    cache_index_.erase(cached);
+}
+
+void SegmentedStorage::cache_object(std::uint64_t id, std::shared_ptr<const Object> object) {
+    if (cache_bytes_ == 0 || !object) {
+        return;
+    }
+    const auto object_size = object->dump().size();
+    if (object_size > cache_bytes_) {
+        return;
+    }
+    drop_cached(id);
+    while (cached_bytes_ + object_size > cache_bytes_ && !cache_order_.empty()) {
+        const auto oldest = cache_order_.begin();
+        cached_bytes_ -= oldest->second->dump().size();
+        cache_index_.erase(oldest->first);
+        cache_order_.erase(oldest);
+    }
+    cache_order_.push_back({id, std::move(object)});
+    cache_index_[id] = std::prev(cache_order_.end());
+    cached_bytes_ += object_size;
+}
+
+std::shared_ptr<const Object> SegmentedStorage::read(std::uint64_t id) {
+    const auto cached = cache_index_.find(id);
+    if (cached != cache_index_.end()) {
+        cache_order_.splice(cache_order_.end(), cache_order_, cached->second);
+        return cached->second->second;
+    }
+    const auto location = object_locations_.find(id);
+    if (location == object_locations_.end()) {
+        return nullptr;
+    }
+    auto object = object_at(location->second);
+    cache_object(id, object);
+    return object;
+}
+
+std::vector<std::uint64_t> SegmentedStorage::query_index(std::string_view field,
+                                                         std::string_view encoded_value) {
+    const auto tree = index_trees_.find(std::string(field));
+    if (tree == index_trees_.end()) {
+        return {};
+    }
+    const auto prefix = make_index_prefix(encoded_value);
+    std::vector<std::uint64_t> ids;
+    auto cursor = tree->second->seek(prefix);
+    while (cursor.valid()) {
+        const auto key = cursor.key();
+        if (key.size() < 16 || key.substr(0, 8) != prefix) {
+            break;
+        }
+        ids.push_back(read_index_id(key));
+        cursor.next();
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+void SegmentedStorage::build_index_tree(const std::string& field) {
+    auto tree = std::make_unique<BPlusTree>(index_path(field));
+    tree->clear();
+    std::vector<std::uint64_t> ids;
+    ids.reserve(object_locations_.size());
+    for (const auto& [id, location] : object_locations_) {
+        static_cast<void>(location);
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    for (const auto id : ids) {
+        const auto location = object_locations_.find(id);
+        if (location != object_locations_.end()) {
+            const auto object = object_at(location->second);
+            const auto entry = object->find(field);
+            if (entry != object->end()) {
+                tree->put(make_index_key(entry->dump(), id), std::string_view{});
+            }
+        }
+    }
+    index_trees_[field] = std::move(tree);
+}
+
+void SegmentedStorage::open_index_trees() {
+    require_valid_indexed_fields(indexed_fields_);
+    index_trees_.clear();
+    for (const auto& field : indexed_fields_) {
+        auto tree = std::make_unique<BPlusTree>(index_path(field));
+        tree->clear();
+        index_trees_[field] = std::move(tree);
+    }
+}
+
+void SegmentedStorage::create_field_index(std::string_view field) {
+    if (field.empty()) {
+        throw std::invalid_argument("Indexed field names cannot be empty.");
+    }
+    const auto existing =
+        std::find_if(indexed_fields_.begin(), indexed_fields_.end(),
+                     [&](const std::string& name) { return std::string_view{name} == field; });
+    if (existing != indexed_fields_.end()) {
+        return;
+    }
+    indexed_fields_.push_back(std::string(field));
+    build_index_tree(std::string(field));
+    disk_backed_ = true;
+    save_manifest();
+}
+
+void SegmentedStorage::drop_field_index(std::string_view field) {
+    const auto entry =
+        std::find_if(indexed_fields_.begin(), indexed_fields_.end(),
+                     [&](const std::string& name) { return std::string_view{name} == field; });
+    if (entry == indexed_fields_.end()) {
+        return;
+    }
+    indexed_fields_.erase(entry);
+    const auto tree = index_trees_.find(std::string(field));
+    if (tree != index_trees_.end()) {
+        const auto path = index_path(field);
+        index_trees_.erase(tree);
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+    save_manifest();
+}
+
+void SegmentedStorage::record_store(std::size_t segment_index, std::uint64_t payload_offset,
+                                    std::uint64_t payload_size, std::uint64_t id,
+                                    const Object& object) {
+    const auto previous = object_locations_.find(id);
+    if (previous != object_locations_.end()) {
+        remove_from_indexes(id, *object_at(previous->second));
+    }
+    drop_cached(id);
+    object_locations_[id] = {segment_index, payload_offset, payload_size};
+    insert_into_indexes(id, object);
+}
+
+void SegmentedStorage::record_erase(std::uint64_t id) {
+    const auto location = object_locations_.find(id);
+    if (location != object_locations_.end()) {
+        remove_from_indexes(id, *object_at(location->second));
+        object_locations_.erase(location);
+    }
+    drop_cached(id);
 }
 
 const std::filesystem::path& SegmentedStorage::manifest_path() const noexcept {
@@ -242,36 +525,37 @@ StorageSnapshot SegmentedStorage::load() {
             throw std::runtime_error("Database manifest has an unsupported or invalid format.");
         }
         const auto manifest_version = manifest.value("format", std::string{});
-        if ((manifest_version != legacy_manifest_format &&
-             manifest_version != batch_manifest_format && manifest_version != manifest_format) ||
+        if (manifest_version != manifest_format ||
             !manifest.contains("next_id") || !manifest["next_id"].is_number_unsigned() ||
             !manifest.contains("segments") || !manifest["segments"].is_array() ||
             manifest["segments"].empty()) {
             throw std::runtime_error("Database manifest has an unsupported or invalid format.");
         }
-        if (manifest_version == manifest_format) {
-            if (!manifest.contains("maximum_objects_per_segment") ||
-                !manifest["maximum_objects_per_segment"].is_number_unsigned() ||
-                manifest["maximum_objects_per_segment"] == 0 || !manifest.contains("schema") ||
-                !manifest["schema"].is_object()) {
-                throw std::runtime_error("Database manifest is missing schema or segment limits.");
-            }
-            maximum_objects_per_segment_ =
-                manifest["maximum_objects_per_segment"].get<std::uint64_t>();
-            schema_ = manifest["schema"];
-            std::string schema_error;
-            if (!validate_object_schema(schema_, &schema_error)) {
-                throw std::runtime_error("Database manifest contains an invalid schema: " +
-                                         schema_error);
-            }
-        } else {
-            maximum_objects_per_segment_ = legacy_default_objects_per_segment;
-            schema_ = {{"type", "object"},
-                       {"properties", Object::object()},
-                       {"additionalProperties", true}};
-            manifest_needs_save = true;
+        if (!manifest.contains("maximum_objects_per_segment") ||
+            !manifest["maximum_objects_per_segment"].is_number_unsigned() ||
+            manifest["maximum_objects_per_segment"] == 0 || !manifest.contains("schema") ||
+            !manifest["schema"].is_object()) {
+            throw std::runtime_error("Database manifest is missing schema or segment limits.");
+        }
+        maximum_objects_per_segment_ =
+            manifest["maximum_objects_per_segment"].get<std::uint64_t>();
+        schema_ = manifest["schema"];
+        std::string schema_error;
+        if (!validate_object_schema(schema_, &schema_error)) {
+            throw std::runtime_error("Database manifest contains an invalid schema: " +
+                                     schema_error);
         }
         next_id_ = manifest["next_id"].get<std::uint64_t>();
+        if (manifest.contains("indexed_fields")) {
+            if (!manifest["indexed_fields"].is_array()) {
+                throw std::runtime_error("Database manifest contains an invalid index list.");
+            }
+            indexed_fields_ = manifest["indexed_fields"].get<std::vector<std::string>>();
+        }
+        if (manifest.contains("cache_bytes") && manifest["cache_bytes"].is_number_unsigned()) {
+            cache_bytes_ = manifest["cache_bytes"].get<std::uint64_t>();
+        }
+        require_valid_indexed_fields(indexed_fields_);
         segment_files_.clear();
         segment_files_.reserve(manifest["segments"].size());
         for (std::size_t index = 0; index < manifest["segments"].size(); ++index) {
@@ -322,10 +606,16 @@ StorageSnapshot SegmentedStorage::load() {
         }
     }
 
+    disk_backed_ = !indexed_fields_.empty() || cache_bytes_ > 0;
+    open_index_trees();
+    object_locations_.clear();
+    cache_order_.clear();
+    cache_index_.clear();
+    cached_bytes_ = 0;
+
     auto recovered_next_id = next_id_;
     std::unordered_set<std::uint64_t> stored_ids;
     segment_object_counts_.resize(segment_files_.size(), 0);
-    std::vector<bool> legacy_segments(segment_files_.size(), false);
     for (std::size_t index = 0; index < segment_files_.size(); ++index) {
         const auto segment_path = directory_ / segment_files_[index];
         if (!path_exists_without_following_symlinks(segment_path)) {
@@ -342,32 +632,26 @@ StorageSnapshot SegmentedStorage::load() {
         std::ifstream input(segment_path, std::ios::binary);
         std::array<char, segment_signature.size()> signature{};
         input.read(signature.data(), static_cast<std::streamsize>(signature.size()));
-        if (!input || (signature != segment_signature && signature != legacy_segment_signature)) {
+        if (!input || signature != segment_signature) {
             throw std::runtime_error("Invalid database segment: " + segment_path.string());
         }
 
-        std::uint64_t valid_size = legacy_header_size;
-        if (signature == segment_signature) {
-            legacy_segments[index] = false;
-            std::uint64_t first_generation = 0;
-            std::uint64_t first_count = 0;
-            const bool first_valid = read_header_slot(input, first_generation, first_count);
-            std::uint64_t second_generation = 0;
-            std::uint64_t second_count = 0;
-            const bool second_valid = read_header_slot(input, second_generation, second_count);
-            if (!first_valid && !second_valid) {
-                throw std::runtime_error("Database segment header counters are corrupt: " +
-                                         segment_path.string());
-            }
-            const auto selected =
-                !second_valid || (first_valid && first_generation >= second_generation)
-                    ? std::pair{first_generation, first_count}
-                    : std::pair{second_generation, second_count};
-            segment_object_counts_[index] = selected.second;
-            valid_size = header_size;
-        } else {
-            legacy_segments[index] = true;
+        std::uint64_t first_generation = 0;
+        std::uint64_t first_count = 0;
+        const bool first_valid = read_header_slot(input, first_generation, first_count);
+        std::uint64_t second_generation = 0;
+        std::uint64_t second_count = 0;
+        const bool second_valid = read_header_slot(input, second_generation, second_count);
+        if (!first_valid && !second_valid) {
+            throw std::runtime_error("Database segment header counters are corrupt: " +
+                                     segment_path.string());
         }
+        const auto selected =
+            !second_valid || (first_valid && first_generation >= second_generation)
+                ? std::pair{first_generation, first_count}
+                : std::pair{second_generation, second_count};
+        segment_object_counts_[index] = selected.second;
+        std::uint64_t valid_size = header_size;
         input.clear();
         input.seekg(static_cast<std::streamoff>(valid_size), std::ios::beg);
         if (!input) {
@@ -425,6 +709,7 @@ StorageSnapshot SegmentedStorage::load() {
                 if (object_size != record.size() - offset) {
                     throw std::runtime_error("Database object record has an invalid payload size.");
                 }
+                const auto payload_offset = record_start + record_length_size + offset;
                 auto object = Object::parse(
                     std::string_view{record}.substr(offset),
                     [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
@@ -440,10 +725,20 @@ StorageSnapshot SegmentedStorage::load() {
                 if (stored_ids.insert(id).second) {
                     ++recovered_object_count;
                 }
-                objects.insert_or_assign(id, std::move(object));
+                object_locations_[id] = ObjectLocation{index, payload_offset, object_size};
+                if (disk_backed_) {
+                    insert_into_indexes(id, object);
+                } else {
+                    objects.insert_or_assign(id, std::move(object));
+                }
             } else if (operation == erase_operation) {
                 if (offset != record.size()) {
                     throw std::runtime_error("Database deletion record contains trailing data.");
+                }
+                if (disk_backed_) {
+                    record_erase(id);
+                } else {
+                    object_locations_.erase(id);
                 }
                 objects.erase(id);
             } else if (operation == batch_operation) {
@@ -468,6 +763,7 @@ StorageSnapshot SegmentedStorage::load() {
                         if (object_size > record.size() - offset) {
                             throw std::runtime_error("Database batch object is truncated.");
                         }
+                        const auto payload_offset = record_start + record_length_size + offset;
                         auto object = Object::parse(
                             std::string_view{record}.substr(offset,
                                                             static_cast<std::size_t>(object_size)),
@@ -486,14 +782,27 @@ StorageSnapshot SegmentedStorage::load() {
                         if (stored_ids.insert(mutation_id).second) {
                             ++recovered_object_count;
                         }
-                        mutations.push_back(
-                            {StorageMutationType::store, mutation_id, std::move(object)});
+                        object_locations_[mutation_id] =
+                            ObjectLocation{index, payload_offset, object_size};
+                        if (disk_backed_) {
+                            insert_into_indexes(mutation_id, object);
+                            mutations.push_back(
+                                {StorageMutationType::store, mutation_id, {}});
+                        } else {
+                            mutations.push_back(
+                                {StorageMutationType::store, mutation_id, std::move(object)});
+                        }
                         if (mutation_id == std::numeric_limits<std::uint64_t>::max()) {
                             recovered_next_id = mutation_id;
                         } else {
                             recovered_next_id = std::max(recovered_next_id, mutation_id + 1);
                         }
                     } else if (mutation_operation == erase_operation) {
+                        if (disk_backed_) {
+                            record_erase(mutation_id);
+                        } else {
+                            object_locations_.erase(mutation_id);
+                        }
                         mutations.push_back({StorageMutationType::erase, mutation_id, {}});
                     } else {
                         throw std::runtime_error(
@@ -503,11 +812,13 @@ StorageSnapshot SegmentedStorage::load() {
                 if (offset != record.size()) {
                     throw std::runtime_error("Database batch record contains trailing data.");
                 }
-                for (auto& mutation : mutations) {
-                    if (mutation.type == StorageMutationType::store) {
-                        objects.insert_or_assign(mutation.id, std::move(mutation.object));
-                    } else {
-                        objects.erase(mutation.id);
+                if (!disk_backed_) {
+                    for (auto& mutation : mutations) {
+                        if (mutation.type == StorageMutationType::store) {
+                            objects.insert_or_assign(mutation.id, std::move(mutation.object));
+                        } else {
+                            objects.erase(mutation.id);
+                        }
                     }
                 }
             } else {
@@ -519,13 +830,7 @@ StorageSnapshot SegmentedStorage::load() {
         }
         segment_object_counts_[index] = recovered_object_count;
         input.close();
-        if (legacy_segments[index]) {
-            if (recovered_object_count > maximum_objects_per_segment_) {
-                maximum_objects_per_segment_ = recovered_object_count;
-            }
-            migrate_legacy_segment(segment_files_[index], recovered_object_count);
-            manifest_needs_save = true;
-        } else if (recorded_object_count != recovered_object_count) {
+        if (recorded_object_count != recovered_object_count) {
             update_segment_object_count(segment_path, recovered_object_count);
         }
         if (segment_object_counts_[index] > maximum_objects_per_segment_) {
@@ -542,9 +847,19 @@ StorageSnapshot SegmentedStorage::load() {
     snapshot.next_id = next_id_;
     snapshot.schema = schema_;
     snapshot.maximum_objects_per_segment = maximum_objects_per_segment_;
-    snapshot.objects.reserve(objects.size());
-    for (auto& [id, object] : objects) {
-        snapshot.objects.push_back({id, std::move(object)});
+    snapshot.indexed_fields = indexed_fields_;
+    snapshot.disk_backed = disk_backed_;
+    if (disk_backed_) {
+        snapshot.object_ids.reserve(object_locations_.size());
+        for (const auto& [id, location] : object_locations_) {
+            static_cast<void>(location);
+            snapshot.object_ids.push_back(id);
+        }
+    } else {
+        snapshot.objects.reserve(objects.size());
+        for (auto& [id, object] : objects) {
+            snapshot.objects.push_back({id, std::move(object)});
+        }
     }
     return snapshot;
 }
@@ -592,7 +907,10 @@ void SegmentedStorage::apply_batch(const std::vector<StorageMutation>& mutations
     record.push_back(batch_operation);
     append_u64(record, 0);
     append_u64(record, static_cast<std::uint64_t>(mutations.size()));
-    for (const auto& mutation : mutations) {
+    std::vector<std::size_t> payload_offsets(mutations.size(), 0);
+    std::vector<std::size_t> payload_sizes(mutations.size(), 0);
+    for (std::size_t index = 0; index < mutations.size(); ++index) {
+        const auto& mutation = mutations[index];
         if (mutation.type == StorageMutationType::store) {
             if (!mutation.object.is_object() || !is_within_object_nesting_depth(mutation.object) ||
                 mutation.id >= next_id) {
@@ -602,6 +920,8 @@ void SegmentedStorage::apply_batch(const std::vector<StorageMutation>& mutations
             record.push_back(store_operation);
             append_u64(record, mutation.id);
             append_u64(record, static_cast<std::uint64_t>(json.size()));
+            payload_offsets[index] = record.size();
+            payload_sizes[index] = json.size();
             record.append(json);
         } else {
             record.push_back(erase_operation);
@@ -612,7 +932,20 @@ void SegmentedStorage::apply_batch(const std::vector<StorageMutation>& mutations
         std::count_if(mutations.begin(), mutations.end(), [&](const auto& mutation) {
             return mutation.type == StorageMutationType::store && mutation.id >= next_id_;
         }));
-    append_payload(std::move(record), next_id, true, created_objects);
+    const auto record_start = append_payload(std::move(record), next_id, true, created_objects);
+    const auto segment_index = segment_files_.size() - 1;
+    for (std::size_t index = 0; index < mutations.size(); ++index) {
+        const auto& mutation = mutations[index];
+        if (mutation.type == StorageMutationType::store) {
+            record_store(segment_index,
+                         record_start + record_length_size +
+                             static_cast<std::uint64_t>(payload_offsets[index]),
+                         static_cast<std::uint64_t>(payload_sizes[index]), mutation.id,
+                         mutation.object);
+        } else {
+            record_erase(mutation.id);
+        }
+    }
 }
 
 void SegmentedStorage::append_record(char operation, std::uint64_t id, const Object* object,
@@ -620,18 +953,27 @@ void SegmentedStorage::append_record(char operation, std::uint64_t id, const Obj
     std::string record;
     record.push_back(operation);
     append_u64(record, id);
+    std::size_t payload_size = 0;
     if (object != nullptr) {
         const auto json = object->dump();
+        payload_size = json.size();
         append_u64(record, static_cast<std::uint64_t>(json.size()));
         record.append(json);
     }
     const auto created_objects =
         object != nullptr && id == next_id_ && next_id > next_id_ ? 1U : 0U;
-    append_payload(std::move(record), next_id, true, created_objects);
+    const auto record_start = append_payload(std::move(record), next_id, true, created_objects);
+    const auto segment_index = segment_files_.size() - 1;
+    if (object != nullptr) {
+        record_store(segment_index, record_start + record_length_size + 1 + 2 * sizeof(std::uint64_t),
+                     payload_size, id, *object);
+    } else {
+        record_erase(id);
+    }
 }
 
-void SegmentedStorage::append_payload(std::string record, std::uint64_t next_id,
-                                      bool update_next_id, std::uint64_t created_objects) {
+std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t next_id,
+                                               bool update_next_id, std::uint64_t created_objects) {
     if (segment_files_.empty()) {
         throw std::logic_error("Database storage must be loaded before writing records.");
     }
@@ -748,6 +1090,7 @@ void SegmentedStorage::append_payload(std::string record, std::uint64_t next_id,
             throw;
         }
     }
+    return segment_size;
 }
 
 void SegmentedStorage::save_manifest() {
@@ -757,6 +1100,8 @@ void SegmentedStorage::save_manifest() {
         {"maximum_objects_per_segment", maximum_objects_per_segment_},
         {"schema", schema_},
         {"segments", segment_files_},
+        {"indexed_fields", indexed_fields_},
+        {"cache_bytes", cache_bytes_},
     };
     auto temporary_path = manifest_path_;
     temporary_path += ".tmp";
@@ -859,41 +1204,6 @@ void SegmentedStorage::update_segment_object_count(const std::filesystem::path& 
         throw std::runtime_error("Could not update database segment object count: " +
                                  path.string());
     }
-}
-
-void SegmentedStorage::migrate_legacy_segment(const std::string& filename,
-                                              std::uint64_t object_count) {
-    const auto path = directory_ / filename;
-    auto temporary = path;
-    temporary += ".v3.tmp";
-    if (path_exists_without_following_symlinks(temporary)) {
-        require_regular_file(temporary, "Temporary upgraded segment");
-        std::filesystem::remove(temporary);
-    }
-    std::ifstream source(path, std::ios::binary);
-    if (!source) {
-        throw std::runtime_error("Could not open legacy segment for migration: " + path.string());
-    }
-    source.seekg(static_cast<std::streamoff>(legacy_header_size), std::ios::beg);
-    std::ofstream destination(temporary, std::ios::binary | std::ios::trunc);
-    if (!destination) {
-        throw std::runtime_error("Could not create upgraded segment: " + temporary.string());
-    }
-    destination.write(segment_signature.data(),
-                      static_cast<std::streamsize>(segment_signature.size()));
-    write_u64(destination, 0);
-    write_u64(destination, object_count);
-    write_u64(destination, header_checksum(0, object_count));
-    write_u64(destination, 0);
-    write_u64(destination, object_count);
-    write_u64(destination, header_checksum(0, object_count));
-    destination << source.rdbuf();
-    destination.close();
-    source.close();
-    if (!destination || source.bad()) {
-        throw std::runtime_error("Could not finish migrating segment: " + path.string());
-    }
-    replace_file(temporary, path);
 }
 
 } // namespace minidb

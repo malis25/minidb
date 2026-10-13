@@ -9,6 +9,8 @@ is not a complete or production-ready chat database/service.
   messages, each with independent IDs and storage directories.
 - Message objects can be queried by exact top-level values such as
   `conversation_id`; ordered ID cursors support fetching older messages.
+- Fields can be indexed with an on-disk B+ tree, and a per-database object cache
+  bounds memory use, so large databases need not hold every object in memory.
 - A single database batch can atomically create messages, update a conversation
   summary, and update related objects in that same database.
 - Segments rotate when their configured count of newly created objects is
@@ -24,9 +26,10 @@ is not a complete or production-ready chat database/service.
    policy, and abuse/rate controls belong in a trusted application service.
    The current server binds to loopback and has no authentication or TLS.
 2. **Growth and durability:** implement and fault-test crash-safe compaction,
-   checksums, automated consistent backups, restore drills, disk-full handling,
-   and migration tools for the older prototype formats. The current append-only
-   files grow indefinitely and live objects/indexes all reside in memory.
+   checksums, automated consistent backups, restore drills, and disk-full
+   handling. The current append-only files grow indefinitely, and index trees
+   are rebuilt by replaying the whole log on every open. Disk-backed mode bounds
+   object memory but still requires those durability guarantees.
 3. **Scale and availability:** define supported database sizes and workload
    limits; benchmark representative message read/write patterns; add metrics,
    operational alerts, and a tested replication/failover plan if availability

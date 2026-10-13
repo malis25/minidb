@@ -3,7 +3,9 @@
 MiniDB is a C++20 learning project for storing JSON objects behind a local
 HTTP API. The database assigns each object a sequential `uint64_t` ID beginning
 at `0`. It maintains an in-memory hash index by ID and equality indexes for
-top-level object properties such as `email`, `username`, or `id`.
+top-level object properties such as `email`, `username`, or `id`. Databases can
+optionally index chosen fields with on-disk B+ trees and bound object memory
+with a per-database cache, so large datasets need not be held entirely in RAM.
 
 This is an early database MVP. It provides atomic batches within one database,
 but not transactions across databases, range queries, field-path indexing,
@@ -29,7 +31,9 @@ CMake fetches cpp-httplib, nlohmann/json, and GoogleTest (GoogleTest only when
 
 `--db-dir` is required and is the root for all databases. Each database stores
 its schema and maximum number of newly created objects per segment in metadata.
-Use `--help` for all options or `--version` for the executable version.
+Use `--cache-mb MEGABYTES` to set a default per-database object-cache budget for
+new databases. Use `--help` for all options or `--version` for the executable
+version.
 
 ## Databases and generated IDs
 
@@ -68,7 +72,8 @@ curl.exe http://127.0.0.1:8080/databases/users/0
 Database object routes use the database path directly:
 `GET /databases/{name}` lists IDs, `POST /databases/{name}` creates an object,
 `GET|PUT|DELETE /databases/{name}/{id}` operate on one object,
-`POST /databases/{name}/query` searches by property, and
+`POST /databases/{name}/query` searches by property,
+`GET|PUT /databases/{name}/indexes` reads or replaces the indexed field set, and
 `GET /databases/{name}/info` returns database metadata.
 `POST /databases/{name}/batch` applies related changes atomically within that
 database. Deleting the `/databases/{name}` path archives or purges that

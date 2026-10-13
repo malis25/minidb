@@ -36,6 +36,7 @@ include(CompilerWarnings)
 # The core library has no main() function. Unit tests and the application can link
 # the same database implementation without duplicating or embedding entry points.
 add_library(minidb_core
+    src/bplus_tree.cpp
     src/database.cpp
     src/segmented_storage.cpp
 )

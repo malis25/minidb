@@ -114,8 +114,10 @@ bool is_real_directory(const std::filesystem::directory_entry& entry) {
 ManagedDatabase::ManagedDatabase(std::unique_ptr<minidb::ObjectStorage> storage)
     : database(std::move(storage)) {}
 
-DatabaseCatalog::DatabaseCatalog(std::filesystem::path root_directory)
-    : root_directory_(std::move(root_directory)), archive_directory_(root_directory_ / ".archive") {
+DatabaseCatalog::DatabaseCatalog(std::filesystem::path root_directory,
+                                 std::uint64_t default_cache_bytes)
+    : root_directory_(std::move(root_directory)), archive_directory_(root_directory_ / ".archive"),
+      default_cache_bytes_(default_cache_bytes) {
     if (root_directory_.empty()) {
         throw std::invalid_argument("Database root directory cannot be empty.");
     }
@@ -128,6 +130,10 @@ DatabaseCatalog::~DatabaseCatalog() = default;
 
 bool DatabaseCatalog::is_valid_name(const std::string& name) noexcept {
     return minidb::is_valid_database_name(name);
+}
+
+std::uint64_t DatabaseCatalog::default_cache_bytes() const noexcept {
+    return default_cache_bytes_;
 }
 
 std::vector<std::string> DatabaseCatalog::active_names() const {
@@ -161,7 +167,9 @@ std::shared_ptr<ManagedDatabase> DatabaseCatalog::find_active(const std::string&
 }
 
 bool DatabaseCatalog::create(const std::string& name, const minidb::ObjectSchema& schema,
-                             std::uint64_t maximum_objects_per_segment) {
+                             std::uint64_t maximum_objects_per_segment,
+                             std::vector<std::string> indexed_fields,
+                             std::uint64_t cache_bytes) {
     if (!is_valid_name(name)) {
         throw std::invalid_argument("Database name must start with a lowercase letter and contain "
                                     "only lowercase letters, digits, '-' or '_'.");
@@ -189,7 +197,8 @@ bool DatabaseCatalog::create(const std::string& name, const minidb::ObjectSchema
     }
     try {
         auto storage = std::make_unique<minidb::SegmentedStorage>(
-            directory, name, maximum_objects_per_segment, schema);
+            directory, name, maximum_objects_per_segment, schema, std::move(indexed_fields),
+            cache_bytes);
         auto database = std::make_shared<ManagedDatabase>(std::move(storage));
         const auto [entry, inserted] = active_databases_.emplace(name, std::move(database));
         static_cast<void>(entry);

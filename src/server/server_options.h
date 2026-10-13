@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -7,6 +8,7 @@
 struct ServerOptions {
     int port = 8080;
     std::filesystem::path database_directory;
+    std::uint64_t cache_bytes = 0;
     bool log_requests = false;
     bool log_details = false;
 };

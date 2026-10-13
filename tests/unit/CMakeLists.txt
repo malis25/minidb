@@ -1,5 +1,6 @@
 # One test executable keeps the unit-test setup simple as the library grows.
 add_executable(minidb_unit_tests
+    bplus_tree_tests.cpp
     database_tests.cpp
     version_tests.cpp
     ${PROJECT_SOURCE_DIR}/app/version.cpp

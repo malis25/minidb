@@ -34,6 +34,9 @@ limited to 128 levels; malformed or deeper JSON returns HTTP 400.
 
 - `--port PORT`: local port from 1 to 65535 (default `8080`).
 - `--db-dir DIRECTORY`: **required** root directory for all database folders.
+- `--cache-mb MEGABYTES`: default per-database object-cache budget in megabytes
+  (default: no cache). Databases created without an explicit `cache_bytes`
+  inherit this value.
 - `--log-requests`: log request method, path, and response status.
 - `--log-details`: also log request and response bodies; bodies can contain
   private object values.
@@ -75,6 +78,8 @@ Content-Type: application/json
 {
   "name":"users",
   "maximum_objects_per_segment":10000,
+  "indexed_fields":["username"],
+  "cache_bytes":67108864,
   "schema":{
     "type":"object",
     "properties":{
@@ -99,6 +104,37 @@ use an `items` schema. Unknown properties are rejected at every object level.
 `maximum_objects_per_segment` must be a positive integer. Invalid names,
 schemas, or limits return HTTP 400. An already active or archived name returns
 HTTP 409; restore an archived database rather than creating over it.
+
+`indexed_fields` is optional: an array of top-level field names to index with an
+on-disk B+ tree, so equality queries over those fields do not scan every object.
+`cache_bytes` is optional: a non-negative byte budget for the in-memory object
+cache; when omitted, the server's `--cache-mb` default is used. Providing either
+one puts the database in disk-backed mode, where object bodies are read from
+segments on demand instead of being held entirely in memory. Both values are
+persisted in the manifest and restored on reopen.
+
+### `GET /databases/{name}/indexes` and `PUT /databases/{name}/indexes`
+
+GET lists the currently indexed field names:
+
+```json
+{"indexed_fields":["username"],"name":"users"}
+```
+
+PUT replaces the indexed field set with the array in the request body, creating
+or dropping indexes as needed and rebuilding dropped/added trees from the stored
+records:
+
+```http
+PUT /databases/users/indexes
+Content-Type: application/json
+
+{"indexed_fields":["username","email"]}
+```
+
+The request requires an `indexed_fields` array of non-empty strings; otherwise it
+returns HTTP 400. The response echoes the resulting set. Query results are
+identical whether or not a field is indexed; indexing only changes performance.
 
 ### `GET /databases/{name}/schema` and `PUT /databases/{name}/schema`
 
@@ -259,13 +295,15 @@ Content-Type: application/json
 }
 ```
 
-Every top-level property is indexed in memory. Equality is exact and
+Every top-level property is indexed in memory, and any field listed in
+`indexed_fields` additionally has an on-disk B+ tree. Equality is exact and
 type-sensitive. Nested subfields, array-element membership, ranges, text
 search, and compound conditions are not supported. Unknown fields or values
 return an empty page. Missing or invalid query fields return HTTP 400. Offset
 pagination must collect matching IDs to select and order the requested page;
 large offset-based result sets therefore require temporary memory proportional
-to the number of matches.
+to the number of matches. Querying an indexed field avoids scanning every
+object; querying any other field falls back to a stored-object scan.
 
 Queries support the same exclusive `after_id` cursor as ID listing. The
 secondary equality index keeps matching IDs ordered, so cursor reads seek to

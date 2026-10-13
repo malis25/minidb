@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -20,13 +21,26 @@ int parse_port(std::string_view value) {
     return port;
 }
 
+std::uint64_t parse_cache_megabytes(std::string_view value) {
+    std::uint64_t megabytes = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), megabytes);
+    constexpr std::uint64_t bytes_per_megabyte = 1024 * 1024;
+    if (error != std::errc{} || end != value.data() + value.size() || megabytes == 0 ||
+        megabytes > std::numeric_limits<std::uint64_t>::max() / bytes_per_megabyte) {
+        throw std::runtime_error("Cache size must be a positive number of megabytes.");
+    }
+    return megabytes * bytes_per_megabyte;
+}
+
 void print_help() {
-    std::cout << "Usage: minidb [--port PORT] --db-dir DIRECTORY "
+    std::cout << "Usage: minidb [--port PORT] --db-dir DIRECTORY [--cache-mb MEGABYTES] "
                  "[--log-requests | --log-details]\n"
-                 "  --port PORT       Port to listen on (default: 8080)\n"
+                 "  --port PORT        Port to listen on (default: 8080)\n"
                  "  --db-dir DIRECTORY Root directory for all databases\n"
-                 "  --log-requests    Log request method, path, and response status\n"
-                 "  --log-details     Also log request and response bodies\n"
+                 "  --cache-mb SIZE    Cache up to SIZE megabytes of objects per database\n"
+                 "  --log-requests     Log request method, path, and response status\n"
+                 "  --log-details      Also log request and response bodies\n"
                  "HTTP API listens on 127.0.0.1 only.\n";
 }
 
@@ -47,6 +61,8 @@ std::optional<ServerOptions> parse_server_options(int argc, char* argv[]) {
             options.port = parse_port(argv[++index]);
         } else if (argument == "--db-dir" && index + 1 < argc) {
             options.database_directory = argv[++index];
+        } else if (argument == "--cache-mb" && index + 1 < argc) {
+            options.cache_bytes = parse_cache_megabytes(argv[++index]);
         } else if (argument == "--log-requests") {
             options.log_requests = true;
         } else if (argument == "--log-details") {

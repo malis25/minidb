@@ -49,7 +49,10 @@ class TemporaryDirectory {
 class FailingStorage final : public minidb::ObjectStorage {
   public:
     [[nodiscard]] minidb::StorageSnapshot load() override {
-        return {{{0, {{"name", "before"}}}}, 1};
+        minidb::StorageSnapshot snapshot;
+        snapshot.objects = {{{0, {{"name", "before"}}}}};
+        snapshot.next_id = 1;
+        return snapshot;
     }
 
     void store(std::uint64_t, const minidb::Object&, std::uint64_t) override {
@@ -356,14 +359,6 @@ TEST(SegmentedStorageTests, ReplaysBatchAsOneAtomicStorageRecord) {
         const auto grace_id = database.create({{"name", "Grace"}, {"room", "general"}});
         const auto segment = directory.path() / "users.segment-00000000.minidb";
         const auto before_batch = std::filesystem::file_size(segment);
-        const auto manifest_path = directory.path() / "users.manifest.json";
-        {
-            std::ifstream input(manifest_path);
-            auto manifest = nlohmann::json::parse(input);
-            manifest["format"] = "MINIDB-MANIFEST-1";
-            std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
-            output << manifest.dump(2) << '\n';
-        }
 
         static_cast<void>(database.apply_batch(
             {{minidb::ObjectMutation::Type::create, 0, {{"name", "Alan"}, {"room", "random"}}},
@@ -380,18 +375,17 @@ TEST(SegmentedStorageTests, ReplaysBatchAsOneAtomicStorageRecord) {
     EXPECT_FALSE(restored.contains(1));
     EXPECT_EQ(restored.get(0)->at("room"), "random");
     EXPECT_EQ(restored.get(2)->at("room"), "random");
-    std::ifstream migrated_manifest_input(manifest_path);
-    const auto migrated_manifest = nlohmann::json::parse(migrated_manifest_input);
-    EXPECT_EQ(migrated_manifest["format"], "MINIDB-MANIFEST-3");
+    std::ifstream manifest_input(manifest_path);
+    const auto manifest = nlohmann::json::parse(manifest_input);
+    EXPECT_EQ(manifest["format"], "MINIDB-MANIFEST-4");
 }
 
-TEST(SegmentedStorageTests, MigratesLegacySegmentHeadersAndPreservesObjects) {
+TEST(SegmentedStorageTests, RejectsLegacyManifestAndSegmentFormats) {
     TemporaryDirectory directory;
     {
         minidb::Database database{
             std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", 10)};
         EXPECT_EQ(database.create({{"name", "Ada"}}), 0);
-        EXPECT_EQ(database.create({{"name", "Grace"}}), 1);
     }
 
     const auto manifest_path = directory.path() / "users.manifest.json";
@@ -399,8 +393,17 @@ TEST(SegmentedStorageTests, MigratesLegacySegmentHeadersAndPreservesObjects) {
         std::ifstream input(manifest_path);
         auto manifest = nlohmann::json::parse(input);
         manifest["format"] = "MINIDB-MANIFEST-2";
-        manifest.erase("maximum_objects_per_segment");
-        manifest.erase("schema");
+        std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
+        output << manifest.dump(2) << '\n';
+    }
+
+    minidb::SegmentedStorage storage_legacy_manifest(directory.path(), "users", 10);
+    EXPECT_THROW(static_cast<void>(storage_legacy_manifest.load()), std::runtime_error);
+
+    {
+        std::ifstream input(manifest_path);
+        auto manifest = nlohmann::json::parse(input);
+        manifest["format"] = "MINIDB-MANIFEST-4";
         std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
         output << manifest.dump(2) << '\n';
     }
@@ -416,32 +419,12 @@ TEST(SegmentedStorageTests, MigratesLegacySegmentHeadersAndPreservesObjects) {
     {
         std::ofstream output(segment_path, std::ios::binary | std::ios::trunc);
         output.write("MINIDB2\0", 8);
-        output.write(segment_bytes.data() + 56,
-                     static_cast<std::streamsize>(segment_bytes.size() - 56));
+        output.write(segment_bytes.data() + 8,
+                     static_cast<std::streamsize>(segment_bytes.size() - 8));
     }
 
-    minidb::Database restored{
-        std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", 1)};
-
-    ASSERT_EQ(restored.size(), 2);
-    EXPECT_EQ(restored.get(0)->at("name"), "Ada");
-    EXPECT_EQ(restored.get(1)->at("name"), "Grace");
-    std::ifstream migrated_manifest_input(manifest_path);
-    const auto migrated_manifest = nlohmann::json::parse(migrated_manifest_input);
-    EXPECT_EQ(migrated_manifest["format"], "MINIDB-MANIFEST-3");
-    EXPECT_EQ(migrated_manifest["maximum_objects_per_segment"], 10000);
-
-    std::ifstream migrated_segment(segment_path, std::ios::binary);
-    std::array<char, 8> signature{};
-    migrated_segment.read(signature.data(), static_cast<std::streamsize>(signature.size()));
-    EXPECT_EQ(std::string(signature.data(), signature.size()), std::string("MINIDB3\0", 8));
-    migrated_segment.seekg(40, std::ios::beg);
-    std::uint64_t migrated_count = 0;
-    for (unsigned int shift = 0; shift < 64; shift += 8) {
-        const auto byte = migrated_segment.get();
-        migrated_count |= static_cast<std::uint64_t>(static_cast<unsigned char>(byte)) << shift;
-    }
-    EXPECT_EQ(migrated_count, 2);
+    minidb::SegmentedStorage storage_legacy_segment(directory.path(), "users", 10);
+    EXPECT_THROW(static_cast<void>(storage_legacy_segment.load()), std::runtime_error);
 }
 
 TEST(SegmentedStorageTests, RecoversNextIdFromACommittedRecord) {
@@ -616,4 +599,96 @@ TEST(SegmentedStorageTests, RejectsMissingManifestWhenOnlyALaterSegmentRemains) 
 
     minidb::SegmentedStorage storage(directory.path(), "users", small_segment_size);
     EXPECT_THROW(static_cast<void>(storage.load()), std::runtime_error);
+}
+
+namespace {
+
+minidb::ObjectSchema default_object_schema() {
+    return {{"type", "object"},
+            {"properties", minidb::Object::object()},
+            {"additionalProperties", true}};
+}
+
+std::unique_ptr<minidb::SegmentedStorage>
+make_disk_storage(const std::filesystem::path& directory, std::vector<std::string> indexed_fields,
+                  std::uint64_t cache_bytes) {
+    return std::make_unique<minidb::SegmentedStorage>(
+        directory, "users", 10000, default_object_schema(), std::move(indexed_fields), cache_bytes);
+}
+
+} // namespace
+
+TEST(DiskBackedStorageTests, ServesFieldIndexesAndObjectsFromDisk) {
+    TemporaryDirectory directory;
+    {
+        minidb::Database database{make_disk_storage(directory.path(), {"email"}, 64)};
+        EXPECT_TRUE(database.disk_backed());
+        EXPECT_EQ(database.create({{"email", "ada@example.test"}, {"name", "Ada"}}), 0);
+        EXPECT_EQ(database.create({{"email", "grace@example.test"}, {"name", "Grace"}}), 1);
+        EXPECT_EQ(database.create({{"email", "ada@example.test"}, {"name", "Ada Two"}}), 2);
+
+        const auto matches = database.find("email", "ada@example.test");
+        ASSERT_EQ(matches.size(), 2U);
+        EXPECT_EQ(matches.front().id, 0U);
+        EXPECT_EQ(matches.back().id, 2U);
+        EXPECT_TRUE(database.find("email", "missing@example.test").empty());
+
+        ASSERT_TRUE(database.get(1));
+        EXPECT_EQ(database.get(1)->at("name"), "Grace");
+
+        EXPECT_TRUE(database.remove(0));
+        EXPECT_EQ(database.find("email", "ada@example.test").size(), 1U);
+    }
+
+    // Reopen without naming indexes: the manifest is authoritative.
+    minidb::Database restored{make_disk_storage(directory.path(), {}, 0)};
+    EXPECT_TRUE(restored.disk_backed());
+    EXPECT_EQ(restored.size(), 2U);
+    ASSERT_EQ(restored.find("email", "grace@example.test").size(), 1U);
+    EXPECT_EQ(restored.find("email", "grace@example.test").front().id, 1U);
+    EXPECT_EQ(restored.find("email", "ada@example.test").size(), 1U);
+}
+
+TEST(DiskBackedStorageTests, ScansNonIndexedFields) {
+    TemporaryDirectory directory;
+    minidb::Database database{make_disk_storage(directory.path(), {"email"}, 0)};
+    static_cast<void>(database.create({{"email", "a@example.test"}, {"city", "Ankara"}}));
+    static_cast<void>(database.create({{"email", "b@example.test"}, {"city", "Izmir"}}));
+
+    const auto matches = database.find("city", "Izmir");
+    ASSERT_EQ(matches.size(), 1U);
+    EXPECT_EQ(matches.front().id, 1U);
+}
+
+TEST(DiskBackedStorageTests, VerifiesCandidatesByReadingStoredObjects) {
+    TemporaryDirectory directory;
+    minidb::Database database{make_disk_storage(directory.path(), {"tag"}, 8)};
+    static_cast<void>(database.create({{"tag", "one"}, {"n", 1}}));
+    static_cast<void>(database.create({{"tag", "two"}, {"n", 2}}));
+    static_cast<void>(database.create({{"tag", 3}, {"n", 3}}));
+
+    EXPECT_EQ(database.find("tag", "one").size(), 1U);
+    EXPECT_EQ(database.find("tag", "two").size(), 1U);
+    EXPECT_EQ(database.find("tag", 3).size(), 1U);
+    EXPECT_TRUE(database.find("tag", "three").empty());
+}
+
+TEST(DiskBackedStorageTests, CreatesIndexesAtRuntime) {
+    TemporaryDirectory directory;
+    minidb::Database database{make_disk_storage(directory.path(), {}, 0)};
+    EXPECT_FALSE(database.disk_backed());
+    static_cast<void>(database.create({{"email", "ada@example.test"}}));
+    static_cast<void>(database.create({{"email", "grace@example.test"}}));
+    EXPECT_EQ(database.find("email", "grace@example.test").size(), 1U);
+
+    database.create_index("email");
+    EXPECT_TRUE(database.disk_backed());
+    ASSERT_EQ(database.indexed_fields().size(), 1U);
+    EXPECT_EQ(database.indexed_fields().front(), "email");
+    ASSERT_EQ(database.find("email", "grace@example.test").size(), 1U);
+    EXPECT_EQ(database.find("email", "grace@example.test").front().id, 1U);
+
+    database.drop_index("email");
+    EXPECT_TRUE(database.indexed_fields().empty());
+    EXPECT_EQ(database.find("email", "ada@example.test").size(), 1U);
 }

@@ -43,7 +43,7 @@ int minidb::server::run(int argc, char* argv[]) {
         }
         const auto& options = *parsed_options;
 
-        DatabaseCatalog catalog{options.database_directory};
+        DatabaseCatalog catalog{options.database_directory, options.cache_bytes};
 
         httplib::Server server;
         server.set_payload_max_length(maximum_request_size);
