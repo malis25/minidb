@@ -1,0 +1,10 @@
+/build/
+/out/
+/data/
+*.minidb
+*.minidb.tmp
+*.manifest.json
+*.manifest.json.tmp
+.vs/
+.vscode/
+CMakeUserPresets.json
