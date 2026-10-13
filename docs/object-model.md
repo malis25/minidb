@@ -29,6 +29,13 @@ number, boolean, null, array, or nested object:
 Objects may be nested up to 128 levels. The same limit applies to arrays and
 objects inside stored property values.
 
+Each persistent database has a schema in its manifest. Schemas specify
+`properties`, each property's type, and a `required` property-name list.
+Supported types are `string`, `integer`, `number`, `boolean`, `null`, `object`,
+and `array`; nested object schemas have their own `properties` and `required`,
+and arrays have an `items` schema. Undeclared fields are rejected. A schema
+change is accepted only if all existing objects pass the new schema.
+
 The object's `"id"` field above is ordinary application data. It is not the
 database ID. If this object is created when the database next ID is `0`, the
 database key is `0`, while the field value remains `"app-user-9"`.
@@ -71,7 +78,9 @@ sorted by ID.
 
 The default `Database` is in-memory only. To persist it, pass a storage
 implementation such as `SegmentedStorage` when constructing it; the server
-does this from its CLI configuration.
+does this from per-database metadata. The `maximum_objects_per_segment` limit
+counts IDs first created in each segment. Updates and deletes do not consume
+the quota.
 
 ## Equality indexes
 

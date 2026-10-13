@@ -25,7 +25,7 @@ class DatabaseCatalog {
     enum class RemoveResult { removed, not_found, archive_exists };
     enum class RestoreResult { restored, not_found, already_active };
 
-    DatabaseCatalog(std::filesystem::path root_directory, std::uint64_t maximum_segment_size);
+    explicit DatabaseCatalog(std::filesystem::path root_directory);
     ~DatabaseCatalog();
 
     DatabaseCatalog(const DatabaseCatalog&) = delete;
@@ -35,7 +35,8 @@ class DatabaseCatalog {
     [[nodiscard]] std::vector<std::string> active_names() const;
     [[nodiscard]] std::vector<std::string> archived_names() const;
     [[nodiscard]] std::shared_ptr<ManagedDatabase> find_active(const std::string& name) const;
-    [[nodiscard]] bool create(const std::string& name);
+    [[nodiscard]] bool create(const std::string& name, const minidb::ObjectSchema& schema,
+                              std::uint64_t maximum_objects_per_segment);
     [[nodiscard]] RemoveResult remove(const std::string& name, bool purge);
     [[nodiscard]] RestoreResult restore(const std::string& name);
 
@@ -46,7 +47,6 @@ class DatabaseCatalog {
 
     std::filesystem::path root_directory_;
     std::filesystem::path archive_directory_;
-    std::uint64_t maximum_segment_size_;
     std::unique_ptr<DatabaseDirectoryLock> directory_lock_;
     mutable std::mutex catalog_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ManagedDatabase>> active_databases_;

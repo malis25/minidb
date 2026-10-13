@@ -11,8 +11,9 @@ is not a complete or production-ready chat database/service.
   `conversation_id`; ordered ID cursors support fetching older messages.
 - A single database batch can atomically create messages, update a conversation
   summary, and update related objects in that same database.
-- Appends are bounded by segment size, recover incomplete trailing records,
-  and preserve complete operations across restart.
+- Segments rotate when their configured count of newly created objects is
+  reached, recover incomplete trailing records, and preserve complete
+  operations across restart. The count is not a physical byte-size limit.
 - Object and query endpoints are paginated; JSON depth and request size are
   bounded.
 

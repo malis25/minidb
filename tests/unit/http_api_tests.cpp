@@ -18,6 +18,26 @@
 
 namespace {
 
+const nlohmann::json test_database_schema = {
+    {"type", "object"},
+    {"properties",
+     {{"name", {{"type", "string"}}},
+      {"username", {{"type", "string"}}},
+      {"email", {{"type", "string"}}},
+      {"text", {{"type", "string"}}},
+      {"group", {{"type", "string"}}},
+      {"room", {{"type", "string"}}},
+      {"active", {{"type", "boolean"}}},
+      {"friends", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+      {"value", {{"type", "object"}, {"properties", nlohmann::json::object()}}}}},
+    {"required", nlohmann::json::array()}};
+
+nlohmann::json database_creation(std::string name, std::uint64_t limit = 10000) {
+    return {{"name", std::move(name)},
+            {"schema", test_database_schema},
+            {"maximum_objects_per_segment", limit}};
+}
+
 class TemporaryDirectory {
   public:
     TemporaryDirectory() {
@@ -49,8 +69,8 @@ class TemporaryDirectory {
 
 class DatabaseApiTests : public ::testing::Test {
   protected:
-    DatabaseApiTests() : catalog_(temporary_directory_.path(), 1024 * 1024), api_(catalog_) {
-        if (!catalog_.create("users")) {
+    DatabaseApiTests() : catalog_(temporary_directory_.path()), api_(catalog_) {
+        if (!catalog_.create("users", test_database_schema, 10000)) {
             throw std::runtime_error("Could not create the initial HTTP test database.");
         }
     }
@@ -106,10 +126,12 @@ TEST_F(DatabaseApiTests, RejectsCrossOriginStateChangingRequests) {
     EXPECT_EQ(rejected_create->status, httplib::StatusCode::Forbidden_403);
 
     const httplib::Headers same_origin{{"Origin", "http://127.0.0.1:" + std::to_string(port_)}};
-    const auto created =
-        client_->Post("/databases/users", same_origin, R"({"name":"Ada"})", "application/json");
+    const auto created = client_->Post("/databases", same_origin,
+                                       database_creation("origin-test").dump(), "application/json");
     ASSERT_TRUE(created);
     ASSERT_EQ(created->status, httplib::StatusCode::Created_201);
+    const auto ada = client_->Post("/databases/users", R"({"name":"Ada"})", "application/json");
+    ASSERT_TRUE(ada);
 
     client_->set_default_headers(cross_origin);
     const auto rejected_update =
@@ -132,7 +154,7 @@ TEST_F(DatabaseApiTests, RejectsCrossOriginStateChangingRequests) {
     const auto databases = client_->Get("/databases");
     ASSERT_TRUE(databases);
     EXPECT_EQ(nlohmann::json::parse(databases->body)["databases"],
-              nlohmann::json::array({"users"}));
+              nlohmann::json::array({"origin-test", "users"}));
 }
 
 TEST_F(DatabaseApiTests, RequiresJsonContentTypeAndLimitsNestingDepth) {
@@ -164,10 +186,12 @@ TEST_F(DatabaseApiTests, RequiresJsonContentTypeAndLimitsNestingDepth) {
 }
 
 TEST_F(DatabaseApiTests, CreatesListsAndIsolatesDatabases) {
-    const auto created = client_->Post("/databases", R"({"name":"messages"})", "application/json");
+    const auto created =
+        client_->Post("/databases", database_creation("messages").dump(), "application/json");
     ASSERT_TRUE(created);
     EXPECT_EQ(created->status, httplib::StatusCode::Created_201);
-    ASSERT_TRUE(client_->Post("/databases", R"({"name":"archived"})", "application/json"));
+    ASSERT_TRUE(
+        client_->Post("/databases", database_creation("archived").dump(), "application/json"));
     const auto archived_named_database = client_->Get("/databases/archived/info");
     ASSERT_TRUE(archived_named_database);
     EXPECT_EQ(archived_named_database->status, httplib::StatusCode::OK_200);
@@ -204,6 +228,79 @@ TEST_F(DatabaseApiTests, CreatesListsAndIsolatesDatabases) {
     EXPECT_EQ(invalid_state->status, httplib::StatusCode::BadRequest_400);
 }
 
+TEST_F(DatabaseApiTests, EnforcesAndPersistsStrictDatabaseSchemaAndObjectLimit) {
+    const nlohmann::json schema = {
+        {"type", "object"},
+        {"properties",
+         {{"username", {{"type", "string"}}},
+          {"friends", {{"type", "array"}, {"items", {{"type", "integer"}}}}}}},
+        {"required", nlohmann::json::array({"username"})}};
+    const auto created = client_->Post(
+        "/databases",
+        nlohmann::json{{"name", "profiles"}, {"schema", schema}, {"maximum_objects_per_segment", 1}}
+            .dump(),
+        "application/json");
+    ASSERT_TRUE(created);
+    ASSERT_EQ(created->status, httplib::StatusCode::Created_201);
+
+    for (const auto* invalid :
+         {R"({"friends":[1]})", R"({"username":4})", R"({"username":"ada","admin":true})",
+          R"({"username":"ada","friends":["bad"]})"}) {
+        const auto rejected = client_->Post("/databases/profiles", invalid, "application/json");
+        ASSERT_TRUE(rejected);
+        EXPECT_EQ(rejected->status, httplib::StatusCode::BadRequest_400) << invalid;
+    }
+    const auto valid = client_->Post("/databases/profiles",
+                                     R"({"username":"ada","friends":[12,18]})", "application/json");
+    ASSERT_TRUE(valid);
+    EXPECT_EQ(valid->status, httplib::StatusCode::Created_201);
+
+    const auto schema_response = client_->Get("/databases/profiles/schema");
+    ASSERT_TRUE(schema_response);
+    const auto schema_body = nlohmann::json::parse(schema_response->body);
+    EXPECT_EQ(schema_body["maximum_objects_per_segment"], 1);
+    EXPECT_EQ(schema_body["schema"], schema);
+
+    const auto second =
+        client_->Post("/databases/profiles", R"({"username":"grace"})", "application/json");
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->status, httplib::StatusCode::Created_201);
+    EXPECT_EQ(nlohmann::json::parse(client_->Get("/databases/profiles/info")->body)["object_count"],
+              2);
+    EXPECT_EQ(
+        std::distance(std::filesystem::directory_iterator(temporary_directory_.path() / "profiles"),
+                      std::filesystem::directory_iterator{}),
+        3);
+}
+
+TEST_F(DatabaseApiTests, SchemaUpdateRejectsExistingObjectsThatWouldBecomeInvalid) {
+    const auto before = client_->Get("/databases/users/schema");
+    ASSERT_TRUE(before);
+    const nlohmann::json incompatible_schema = {
+        {"type", "object"},
+        {"properties", {{"username", {{"type", "string"}}}}},
+        {"required", nlohmann::json::array({"username"})}};
+
+    ASSERT_TRUE(client_->Post("/databases/users", R"({"name":"Ada"})", "application/json"));
+    const auto rejected =
+        client_->Put("/databases/users/schema", incompatible_schema.dump(), "application/json");
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->status, httplib::StatusCode::Conflict_409);
+    EXPECT_EQ(nlohmann::json::parse(client_->Get("/databases/users/schema")->body)["schema"],
+              test_database_schema);
+
+    const nlohmann::json compatible_schema = {
+        {"type", "object"},
+        {"properties", {{"name", {{"type", "string"}}}, {"username", {{"type", "string"}}}}},
+        {"required", nlohmann::json::array()}};
+    const auto updated =
+        client_->Put("/databases/users/schema", compatible_schema.dump(), "application/json");
+    ASSERT_TRUE(updated);
+    EXPECT_EQ(updated->status, httplib::StatusCode::OK_200);
+    EXPECT_EQ(nlohmann::json::parse(client_->Get("/databases/users/0")->body)["object"]["name"],
+              "Ada");
+}
+
 TEST_F(DatabaseApiTests, ArchivesRestoresAndPurgesDatabasesOnRequest) {
     ASSERT_TRUE(client_->Post("/databases/users", R"({"name":"Ada"})", "application/json"));
     const auto archived = client_->Delete("/databases/users");
@@ -231,15 +328,18 @@ TEST_F(DatabaseApiTests, ArchivesRestoresAndPurgesDatabasesOnRequest) {
 }
 
 TEST_F(DatabaseApiTests, RejectsInvalidDatabaseNamesAndDuplicateCreation) {
-    const auto invalid = client_->Post("/databases", R"({"name":"../users"})", "application/json");
+    const auto invalid =
+        client_->Post("/databases", database_creation("../users").dump(), "application/json");
     ASSERT_TRUE(invalid);
     EXPECT_EQ(invalid->status, httplib::StatusCode::BadRequest_400);
 
-    const auto reserved = client_->Post("/databases", R"({"name":"con"})", "application/json");
+    const auto reserved =
+        client_->Post("/databases", database_creation("con").dump(), "application/json");
     ASSERT_TRUE(reserved);
     EXPECT_EQ(reserved->status, httplib::StatusCode::BadRequest_400);
 
-    const auto duplicate = client_->Post("/databases", R"({"name":"users"})", "application/json");
+    const auto duplicate =
+        client_->Post("/databases", database_creation("users").dump(), "application/json");
     ASSERT_TRUE(duplicate);
     EXPECT_EQ(duplicate->status, httplib::StatusCode::Conflict_409);
 }
@@ -347,20 +447,19 @@ TEST_F(DatabaseApiTests, AppliesDatabaseBatchAtomically) {
 
 TEST(DatabaseCatalogTests, RejectsConcurrentUseOfTheSameDatabaseDirectory) {
     TemporaryDirectory temporary_directory;
-    DatabaseCatalog first(temporary_directory.path(), 1024 * 1024);
+    DatabaseCatalog first(temporary_directory.path());
 
-    EXPECT_THROW(DatabaseCatalog second(temporary_directory.path(), 1024 * 1024),
-                 std::system_error);
+    EXPECT_THROW(DatabaseCatalog second(temporary_directory.path()), std::system_error);
 }
 
 TEST(DatabaseCatalogTests, RestoresPersistedDatabaseAfterCatalogRestart) {
     TemporaryDirectory temporary_directory;
     const auto create_catalog = [&] {
-        return std::make_unique<DatabaseCatalog>(temporary_directory.path(), 1024 * 1024);
+        return std::make_unique<DatabaseCatalog>(temporary_directory.path());
     };
     {
         auto catalog = create_catalog();
-        ASSERT_TRUE(catalog->create("users"));
+        ASSERT_TRUE(catalog->create("users", test_database_schema, 10000));
         const auto database = catalog->find_active("users");
         ASSERT_TRUE(database);
         {
@@ -511,31 +610,29 @@ TEST_F(DatabaseApiTests, RejectsMalformedPropertyQueries) {
     EXPECT_EQ(malformed_json->status, httplib::StatusCode::BadRequest_400);
 }
 
-TEST(ServerOptionsTests, ParsesRequiredMaximumFileSize) {
+TEST(ServerOptionsTests, ParsesDatabaseDirectoryWithoutStorageSizingOption) {
     char program[] = "minidb";
     char directory_flag[] = "--db-dir";
     char directory[] = "data";
-    char size_flag[] = "--max-file-size";
-    char size[] = "1048576";
-    char* arguments[] = {program, directory_flag, directory, size_flag, size};
+    char* arguments[] = {program, directory_flag, directory};
 
     const auto options = parse_server_options(static_cast<int>(std::size(arguments)), arguments);
 
     ASSERT_TRUE(options);
-    EXPECT_EQ(options->maximum_file_size, 1048576);
+    EXPECT_EQ(options->database_directory, "data");
 }
 
-TEST(ServerOptionsTests, RejectsMissingOrInvalidMaximumFileSize) {
+TEST(ServerOptionsTests, RejectsMissingDirectoryAndRemovedByteLimitOption) {
     char program[] = "minidb";
     char directory_flag[] = "--db-dir";
     char directory[] = "data";
-    char* incomplete[] = {program, directory_flag, directory};
+    char* incomplete[] = {program};
     EXPECT_THROW(parse_server_options(static_cast<int>(std::size(incomplete)), incomplete),
                  std::runtime_error);
 
     char size_flag[] = "--max-file-size";
-    char invalid_size[] = "0";
-    char* invalid[] = {program, directory_flag, directory, size_flag, invalid_size};
+    char size[] = "1024";
+    char* invalid[] = {program, directory_flag, directory, size_flag, size};
     EXPECT_THROW(parse_server_options(static_cast<int>(std::size(invalid)), invalid),
                  std::runtime_error);
 }

@@ -37,10 +37,23 @@ Database::Database(std::unique_ptr<ObjectStorage> storage) : storage_(std::move(
 
     auto snapshot = storage_->load();
     next_id_ = snapshot.next_id;
+    if (!snapshot.schema.is_null()) {
+        schema_ = std::move(snapshot.schema);
+        std::string schema_error;
+        if (!validate_object_schema(schema_, &schema_error)) {
+            throw std::runtime_error("Storage returned an invalid object schema: " + schema_error);
+        }
+        maximum_objects_per_segment_ = snapshot.maximum_objects_per_segment;
+    }
     objects_.reserve(snapshot.objects.size());
     for (auto& stored : snapshot.objects) {
         if (!stored.object.is_object()) {
             throw std::runtime_error("Storage returned an invalid database object.");
+        }
+        std::string validation_error;
+        if (!validate_object_against_schema(stored.object, schema_, &validation_error)) {
+            throw std::runtime_error("Stored object does not match the database schema: " +
+                                     validation_error);
         }
         if (stored.id >= next_id_ && stored.id != std::numeric_limits<std::uint64_t>::max()) {
             next_id_ = stored.id + 1;
@@ -89,8 +102,9 @@ std::vector<std::uint64_t> Database::apply_batch(const std::vector<ObjectMutatio
     for (const auto& mutation : mutations) {
         switch (mutation.type) {
         case ObjectMutation::Type::create: {
-            if (!mutation.object.is_object()) {
-                throw std::invalid_argument("A database object must be a JSON object.");
+            std::string validation_error;
+            if (!validate_object_against_schema(mutation.object, schema_, &validation_error)) {
+                throw std::invalid_argument(validation_error);
             }
             if (!is_within_object_nesting_depth(mutation.object)) {
                 throw std::invalid_argument("JSON nesting exceeds the maximum depth of 128.");
@@ -106,8 +120,9 @@ std::vector<std::uint64_t> Database::apply_batch(const std::vector<ObjectMutatio
             break;
         }
         case ObjectMutation::Type::replace: {
-            if (!mutation.object.is_object()) {
-                throw std::invalid_argument("A database object must be a JSON object.");
+            std::string validation_error;
+            if (!validate_object_against_schema(mutation.object, schema_, &validation_error)) {
+                throw std::invalid_argument(validation_error);
             }
             if (!is_within_object_nesting_depth(mutation.object)) {
                 throw std::invalid_argument("JSON nesting exceeds the maximum depth of 128.");
@@ -165,6 +180,32 @@ std::vector<std::uint64_t> Database::apply_batch(const std::vector<ObjectMutatio
     }
     next_id_ = following_id;
     return created_ids;
+}
+
+void Database::update_schema(ObjectSchema schema) {
+    std::string schema_error;
+    if (!validate_object_schema(schema, &schema_error)) {
+        throw std::invalid_argument(schema_error);
+    }
+    for (const auto& [id, object] : objects_) {
+        static_cast<void>(id);
+        if (!validate_object_against_schema(*object, schema, &schema_error)) {
+            throw std::invalid_argument("Existing objects do not satisfy the new schema: " +
+                                        schema_error);
+        }
+    }
+    if (storage_) {
+        storage_->update_schema(schema);
+    }
+    schema_ = std::move(schema);
+}
+
+const ObjectSchema& Database::schema() const noexcept {
+    return schema_;
+}
+
+std::uint64_t Database::maximum_objects_per_segment() const noexcept {
+    return maximum_objects_per_segment_;
 }
 
 std::shared_ptr<const Object> Database::get(std::uint64_t id) const {

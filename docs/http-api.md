@@ -11,13 +11,13 @@ From PowerShell at the repository root:
 ```powershell
 cmake -S . -B build
 cmake --build build --config Debug
-.\build\Debug\minidb.exe --db-dir data --max-file-size 67108864
+.\build\Debug\minidb.exe --db-dir data
 ```
 
 The server listens on `127.0.0.1:8080` by default. `--db-dir` is the root
 directory for all databases. Existing active databases under this root are
-loaded on startup. Each database must be reopened with the segment-size limit
-stored in its manifest.
+loaded on startup. Each database's object schema and maximum objects per
+segment are stored in its manifest.
 
 State-changing requests with an `Origin` header are accepted only when the
 origin exactly matches the request host and uses the loopback hostname
@@ -34,15 +34,15 @@ limited to 128 levels; malformed or deeper JSON returns HTTP 400.
 
 - `--port PORT`: local port from 1 to 65535 (default `8080`).
 - `--db-dir DIRECTORY`: **required** root directory for all database folders.
-- `--max-file-size BYTES`: **required** maximum size of each database segment.
 - `--log-requests`: log request method, path, and response status.
 - `--log-details`: also log request and response bodies; bodies can contain
   private object values.
 - `--help`: show usage.
 
-Each segment contains a small header, so the minimum accepted limit is 35
-bytes. A record that cannot fit in an empty segment is rejected; records are
-not split between files. The limit includes the segment header.
+The server command line does not set segment limits. Each database creation
+request provides `maximum_objects_per_segment`; each segment header stores the
+number of newly created objects assigned to that segment. Payload size does not
+trigger rollover, and one record is never split between segments.
 
 ## Database lifecycle
 
@@ -72,7 +72,19 @@ Creates an empty database. Returns HTTP 201:
 POST /databases
 Content-Type: application/json
 
-{"name":"users"}
+{
+  "name":"users",
+  "maximum_objects_per_segment":10000,
+  "schema":{
+    "type":"object",
+    "properties":{
+      "username":{"type":"string"},
+      "email":{"type":"string"},
+      "friends":{"type":"array","items":{"type":"integer"}}
+    },
+    "required":["username","email"]
+  }
+}
 ```
 
 Response:
@@ -81,8 +93,19 @@ Response:
 {"created":true,"name":"users"}
 ```
 
-Invalid names return HTTP 400. An already active or archived name returns
+The schema supports `string`, `integer`, `number`, `boolean`, `null`, `object`,
+and `array` types; nested objects use `properties` and `required`, and arrays
+use an `items` schema. Unknown properties are rejected at every object level.
+`maximum_objects_per_segment` must be a positive integer. Invalid names,
+schemas, or limits return HTTP 400. An already active or archived name returns
 HTTP 409; restore an archived database rather than creating over it.
+
+### `GET /databases/{name}/schema` and `PUT /databases/{name}/schema`
+
+GET returns the persisted schema and segment object-count limit. PUT replaces
+the schema only when every existing object satisfies it; otherwise it returns
+HTTP 409 and keeps the previous schema. New and replacement objects are
+validated against the current schema before any data is written.
 
 ### `GET /databases/{name}/info`
 

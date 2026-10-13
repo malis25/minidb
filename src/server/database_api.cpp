@@ -425,19 +425,101 @@ void DatabaseApi::register_routes(httplib::Server& server) {
                        httplib::StatusCode::BadRequest_400);
             return;
         }
+        if (!body.contains("schema") || !body["schema"].is_object() ||
+            !body.contains("maximum_objects_per_segment") ||
+            !body["maximum_objects_per_segment"].is_number_unsigned() ||
+            body["maximum_objects_per_segment"] == 0) {
+            send_error(response,
+                       "Request body requires schema and a positive "
+                       "maximum_objects_per_segment.",
+                       httplib::StatusCode::BadRequest_400);
+            return;
+        }
         const auto name = body["name"].get<std::string>();
         if (!DatabaseCatalog::is_valid_name(name)) {
             send_error(response, "Invalid database name.", httplib::StatusCode::BadRequest_400);
             return;
         }
         try {
-            if (!catalog_.create(name)) {
+            const auto schema = body["schema"];
+            std::string schema_error;
+            if (!minidb::validate_object_schema(schema, &schema_error) ||
+                !minidb::is_strict_object_schema(schema)) {
+                send_error(response,
+                           schema_error.empty() ? "Schema must reject additional properties."
+                                                : schema_error,
+                           httplib::StatusCode::BadRequest_400);
+                return;
+            }
+            const auto maximum_objects_per_segment =
+                body["maximum_objects_per_segment"].get<std::uint64_t>();
+            if (!catalog_.create(name, schema, maximum_objects_per_segment)) {
                 send_error(response, "Database already exists: " + name,
                            httplib::StatusCode::Conflict_409);
                 return;
             }
             send_json(response, {{"name", name}, {"created", true}},
                       httplib::StatusCode::Created_201);
+        } catch (const std::invalid_argument& error) {
+            send_error(response, error.what(), httplib::StatusCode::BadRequest_400);
+        } catch (const std::exception& error) {
+            send_error(response, error.what(), httplib::StatusCode::InternalServerError_500);
+        }
+    });
+
+    server.Get("/databases/:name/schema", [this](const httplib::Request& request,
+                                                 httplib::Response& response) {
+        const auto name = request.path_params.at("name");
+        const auto database = find_database(catalog_, name, response);
+        if (!database) {
+            return;
+        }
+        std::lock_guard lock(database->mutex);
+        if (!is_active(database, name, response)) {
+            return;
+        }
+        send_json(
+            response,
+            {{"name", name},
+             {"schema", database->database.schema()},
+             {"maximum_objects_per_segment", database->database.maximum_objects_per_segment()}},
+            httplib::StatusCode::OK_200);
+    });
+
+    server.Put("/databases/:name/schema", [this](const httplib::Request& request,
+                                                 httplib::Response& response) {
+        if (reject_cross_origin_mutation(request, response)) {
+            return;
+        }
+        const auto name = request.path_params.at("name");
+        nlohmann::json schema;
+        if (!parse_json_body(request, schema, response)) {
+            return;
+        }
+        std::string schema_error;
+        if (!schema.is_object() || !minidb::validate_object_schema(schema, &schema_error) ||
+            !minidb::is_strict_object_schema(schema)) {
+            send_error(response,
+                       schema_error.empty() ? "Schema must reject additional properties."
+                                            : schema_error,
+                       httplib::StatusCode::BadRequest_400);
+            return;
+        }
+        const auto database = find_database(catalog_, name, response);
+        if (!database) {
+            return;
+        }
+        std::lock_guard lock(database->mutex);
+        if (!is_active(database, name, response)) {
+            return;
+        }
+        try {
+            database->database.update_schema(std::move(schema));
+            send_json(response,
+                      {{"name", name}, {"schema", database->database.schema()}, {"updated", true}},
+                      httplib::StatusCode::OK_200);
+        } catch (const std::invalid_argument& error) {
+            send_error(response, error.what(), httplib::StatusCode::Conflict_409);
         } catch (const std::exception& error) {
             send_error(response, error.what(), httplib::StatusCode::InternalServerError_500);
         }
@@ -635,6 +717,8 @@ void DatabaseApi::register_routes(httplib::Server& server) {
                 const auto id = database->database.create(std::move(object));
                 send_json(response, {{"id", id}, {"object", *database->database.get(id)}},
                           httplib::StatusCode::Created_201);
+            } catch (const std::invalid_argument& error) {
+                send_error(response, error.what(), httplib::StatusCode::BadRequest_400);
             } catch (const std::exception& error) {
                 send_error(response, error.what(), httplib::StatusCode::InternalServerError_500);
             }

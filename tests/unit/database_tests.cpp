@@ -1,6 +1,7 @@
 #include "minidb/database.h"
 #include "minidb/storage.h"
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -62,9 +63,13 @@ class FailingStorage final : public minidb::ObjectStorage {
     void apply_batch(const std::vector<minidb::StorageMutation>&, std::uint64_t) override {
         throw std::runtime_error("Test storage failure.");
     }
+
+    void update_schema(const minidb::ObjectSchema&) override {
+        throw std::runtime_error("Test storage failure.");
+    }
 };
 
-constexpr std::uint64_t small_segment_size = 80;
+constexpr std::uint64_t small_segment_size = 1;
 
 } // namespace
 
@@ -267,7 +272,7 @@ TEST(DatabaseTests, ValidatesEntireBatchBeforePersistingOrPublishingChanges) {
     EXPECT_EQ(database.get(id)->at("name"), "Ada");
 }
 
-TEST(SegmentedStorageTests, CreatesManifestAndRollsOverAtConfiguredLimit) {
+TEST(SegmentedStorageTests, CreatesCountBoundedSegmentsAndRecordsHeaderCounts) {
     TemporaryDirectory directory;
     {
         minidb::Database database{std::make_unique<minidb::SegmentedStorage>(
@@ -288,8 +293,35 @@ TEST(SegmentedStorageTests, CreatesManifestAndRollsOverAtConfiguredLimit) {
         filename << "users.segment-" << std::setw(8) << std::setfill('0') << index << ".minidb";
         const auto segment = directory.path() / filename.str();
         ASSERT_TRUE(std::filesystem::is_regular_file(segment));
-        EXPECT_LE(std::filesystem::file_size(segment), small_segment_size);
+        std::ifstream header(segment, std::ios::binary);
+        std::array<char, 8> signature{};
+        header.read(signature.data(), static_cast<std::streamsize>(signature.size()));
+        EXPECT_EQ(std::string(signature.data(), signature.size()), std::string("MINIDB3\0", 8));
+        header.seekg(40, std::ios::beg);
+        std::uint64_t stored_count = 0;
+        for (unsigned int shift = 0; shift < 64; shift += 8) {
+            const auto byte = header.get();
+            stored_count |= static_cast<std::uint64_t>(static_cast<unsigned char>(byte)) << shift;
+        }
+        EXPECT_EQ(stored_count, 1);
     }
+}
+
+TEST(SegmentedStorageTests, UpdatesAndDeletesDoNotConsumeObjectCreationQuota) {
+    TemporaryDirectory directory;
+    minidb::Database database{
+        std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", 1)};
+
+    const auto first_id = database.create({{"name", "Ada"}});
+    database.set(first_id, {{"name", "Grace"}});
+    EXPECT_TRUE(database.remove(first_id));
+    const auto second_id = database.create({{"name", "Alan"}});
+
+    EXPECT_EQ(first_id, 0);
+    EXPECT_EQ(second_id, 1);
+    std::ifstream manifest_input(directory.path() / "users.manifest.json");
+    const auto manifest = nlohmann::json::parse(manifest_input);
+    EXPECT_EQ(manifest["segments"].size(), 2);
 }
 
 TEST(SegmentedStorageTests, PersistsIdsIndexesUpdatesAndDeletesAcrossRestart) {
@@ -350,7 +382,66 @@ TEST(SegmentedStorageTests, ReplaysBatchAsOneAtomicStorageRecord) {
     EXPECT_EQ(restored.get(2)->at("room"), "random");
     std::ifstream migrated_manifest_input(manifest_path);
     const auto migrated_manifest = nlohmann::json::parse(migrated_manifest_input);
-    EXPECT_EQ(migrated_manifest["format"], "MINIDB-MANIFEST-2");
+    EXPECT_EQ(migrated_manifest["format"], "MINIDB-MANIFEST-3");
+}
+
+TEST(SegmentedStorageTests, MigratesLegacySegmentHeadersAndPreservesObjects) {
+    TemporaryDirectory directory;
+    {
+        minidb::Database database{
+            std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", 10)};
+        EXPECT_EQ(database.create({{"name", "Ada"}}), 0);
+        EXPECT_EQ(database.create({{"name", "Grace"}}), 1);
+    }
+
+    const auto manifest_path = directory.path() / "users.manifest.json";
+    {
+        std::ifstream input(manifest_path);
+        auto manifest = nlohmann::json::parse(input);
+        manifest["format"] = "MINIDB-MANIFEST-2";
+        manifest.erase("maximum_objects_per_segment");
+        manifest.erase("schema");
+        std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
+        output << manifest.dump(2) << '\n';
+    }
+
+    const auto segment_path = directory.path() / "users.segment-00000000.minidb";
+    std::vector<char> segment_bytes;
+    {
+        std::ifstream input(segment_path, std::ios::binary);
+        segment_bytes.assign(std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>());
+    }
+    ASSERT_GE(segment_bytes.size(), 56);
+    {
+        std::ofstream output(segment_path, std::ios::binary | std::ios::trunc);
+        output.write("MINIDB2\0", 8);
+        output.write(segment_bytes.data() + 56,
+                     static_cast<std::streamsize>(segment_bytes.size() - 56));
+    }
+
+    minidb::Database restored{
+        std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", 1)};
+
+    ASSERT_EQ(restored.size(), 2);
+    EXPECT_EQ(restored.get(0)->at("name"), "Ada");
+    EXPECT_EQ(restored.get(1)->at("name"), "Grace");
+    std::ifstream migrated_manifest_input(manifest_path);
+    const auto migrated_manifest = nlohmann::json::parse(migrated_manifest_input);
+    EXPECT_EQ(migrated_manifest["format"], "MINIDB-MANIFEST-3");
+    EXPECT_EQ(migrated_manifest["maximum_objects_per_segment"], 10000);
+
+    std::ifstream migrated_segment(segment_path, std::ios::binary);
+    std::array<char, 8> signature{};
+    migrated_segment.read(signature.data(), static_cast<std::streamsize>(signature.size()));
+    EXPECT_EQ(std::string(signature.data(), signature.size()), std::string("MINIDB3\0", 8));
+    migrated_segment.seekg(40, std::ios::beg);
+    std::uint64_t migrated_count = 0;
+    for (unsigned int shift = 0; shift < 64; shift += 8) {
+        const auto byte = migrated_segment.get();
+        migrated_count |= static_cast<std::uint64_t>(static_cast<unsigned char>(byte)) << shift;
+    }
+    EXPECT_EQ(migrated_count, 2);
 }
 
 TEST(SegmentedStorageTests, RecoversNextIdFromACommittedRecord) {
@@ -396,12 +487,6 @@ TEST(SegmentedStorageTests, TruncatesAnIncompleteFinalRecord) {
         std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", small_segment_size)};
     EXPECT_EQ(restored.get(0)->at("name"), "Ada");
     EXPECT_EQ(std::filesystem::file_size(segment_path), complete_size);
-}
-
-TEST(SegmentedStorageTests, RejectsAFileLimitTooSmallForAnObject) {
-    TemporaryDirectory directory;
-
-    EXPECT_THROW(minidb::SegmentedStorage(directory.path(), "users", 1), std::invalid_argument);
 }
 
 TEST(SegmentedStorageTests, RejectsUnsafeAndPlatformReservedDatabaseNames) {
@@ -454,7 +539,18 @@ TEST(SegmentedStorageTests, RecoversAnEmptySegmentCreatedBeforeManifestCommit) {
     const auto orphan_path = directory.path() / "users.segment-00000001.minidb";
     {
         std::ofstream orphan(orphan_path, std::ios::binary);
-        orphan.write("MINIDB2\0", 8);
+        const auto write_u64 = [&](std::uint64_t value) {
+            for (unsigned int shift = 0; shift < 64; shift += 8) {
+                orphan.put(static_cast<char>((value >> shift) & 0xff));
+            }
+        };
+        orphan.write("MINIDB3\0", 8);
+        write_u64(0);
+        write_u64(0);
+        write_u64(0x4d494e4944423300ULL);
+        write_u64(0);
+        write_u64(0);
+        write_u64(0x4d494e4944423300ULL);
     }
 
     minidb::Database restored{

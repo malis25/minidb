@@ -114,15 +114,10 @@ bool is_real_directory(const std::filesystem::directory_entry& entry) {
 ManagedDatabase::ManagedDatabase(std::unique_ptr<minidb::ObjectStorage> storage)
     : database(std::move(storage)) {}
 
-DatabaseCatalog::DatabaseCatalog(std::filesystem::path root_directory,
-                                 std::uint64_t maximum_segment_size)
-    : root_directory_(std::move(root_directory)), archive_directory_(root_directory_ / ".archive"),
-      maximum_segment_size_(maximum_segment_size) {
+DatabaseCatalog::DatabaseCatalog(std::filesystem::path root_directory)
+    : root_directory_(std::move(root_directory)), archive_directory_(root_directory_ / ".archive") {
     if (root_directory_.empty()) {
         throw std::invalid_argument("Database root directory cannot be empty.");
-    }
-    if (maximum_segment_size_ < 35) {
-        throw std::invalid_argument("Maximum file size is too small for a database object.");
     }
     std::filesystem::create_directories(root_directory_);
     directory_lock_ = std::make_unique<DatabaseDirectoryLock>(root_directory_ / ".minidb.lock");
@@ -165,10 +160,21 @@ std::shared_ptr<ManagedDatabase> DatabaseCatalog::find_active(const std::string&
     return database == active_databases_.end() ? nullptr : database->second;
 }
 
-bool DatabaseCatalog::create(const std::string& name) {
+bool DatabaseCatalog::create(const std::string& name, const minidb::ObjectSchema& schema,
+                             std::uint64_t maximum_objects_per_segment) {
     if (!is_valid_name(name)) {
         throw std::invalid_argument("Database name must start with a lowercase letter and contain "
                                     "only lowercase letters, digits, '-' or '_'.");
+    }
+    std::string schema_error;
+    if (!minidb::validate_object_schema(schema, &schema_error) ||
+        !minidb::is_strict_object_schema(schema)) {
+        throw std::invalid_argument(
+            "Invalid strict database object schema: " +
+            (schema_error.empty() ? "additional properties are allowed." : schema_error));
+    }
+    if (maximum_objects_per_segment == 0) {
+        throw std::invalid_argument("maximum_objects_per_segment must be positive.");
     }
 
     std::lock_guard lock(catalog_mutex_);
@@ -182,7 +188,9 @@ bool DatabaseCatalog::create(const std::string& name) {
         return false;
     }
     try {
-        auto database = open_database(directory, name);
+        auto storage = std::make_unique<minidb::SegmentedStorage>(
+            directory, name, maximum_objects_per_segment, schema);
+        auto database = std::make_shared<ManagedDatabase>(std::move(storage));
         const auto [entry, inserted] = active_databases_.emplace(name, std::move(database));
         static_cast<void>(entry);
         if (!inserted) {
@@ -279,8 +287,7 @@ DatabaseCatalog::RestoreResult DatabaseCatalog::restore(const std::string& name)
 std::shared_ptr<ManagedDatabase>
 DatabaseCatalog::open_database(const std::filesystem::path& directory,
                                const std::string& name) const {
-    auto storage =
-        std::make_unique<minidb::SegmentedStorage>(directory, name, maximum_segment_size_);
+    auto storage = std::make_unique<minidb::SegmentedStorage>(directory, name);
     return std::make_shared<ManagedDatabase>(std::move(storage));
 }
 

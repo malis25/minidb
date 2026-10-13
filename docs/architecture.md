@@ -5,8 +5,10 @@
 MiniDB stores JSON objects in a local database and exposes them through HTTP.
 The database assigns sequential `uint64_t` IDs starting at zero. Its in-memory
 indexes support lookup by ID and exact equality lookup on each top-level
-property. It supports atomic single-database batches. It has no SQL, schema
-system, field-path queries, range queries, or cross-database transactions.
+property. Every database persists an object schema and validates writes against
+it; strict schemas reject undeclared properties. It supports atomic
+single-database batches. It has no SQL, field-path queries, range queries, or
+cross-database transactions.
 
 ## Project layers
 
@@ -23,8 +25,8 @@ src/server/server.cpp           per-database Database ---> ObjectStorage
                                  ID/property indexes    SegmentedStorage
                                                            |        |
                                                            v        v
-                                                       manifest   bounded
-                                                       and files  segments
+                                                       manifest   segments
+                                                       and files  (object quota)
 ```
 
 - `include/minidb/object.h` defines a JSON-backed `minidb::Object`.
@@ -80,18 +82,19 @@ database. The core class itself is not internally synchronized.
 `<root>/<name>/<name>.manifest.json` with ordered
 `<name>.segment-NNNNNNNN.minidb` data files. Archived databases move to
 `<root>/.archive/<name>/` and are not opened until restored. The manifest
-contains the segment list, fixed configured size limit, and next ID. Data
-files are append-only; each record stores an operation, numeric ID, and (for
-stores) a JSON object. A batch is one log record containing all of its
-operations, so recovery applies the whole batch or truncates an incomplete
-trailing batch. Segment rollover creates a fresh bounded file and records it
-in the manifest before appending data.
+contains the schema, maximum newly-created objects per segment, segment list,
+and next ID. Data files are append-only; each record stores an operation,
+numeric ID, and (for stores) a JSON object. A batch is one log record
+containing all of its operations, so recovery applies the whole batch or
+truncates an incomplete trailing batch. A dual-slot segment header stores the
+creation count for that segment; updates and deletes do not consume the object
+quota. Reaching the quota moves the next create to a new segment.
 
 `Database` depends on the `ObjectStorage` contract rather than parsing file
 names or binary records. A future sharded directory backend or another storage
 implementation can preserve the object/API contract. The current backend
-requires the same max-size setting at restart, loads all live objects into
-memory, and has no compaction. An operating-system lock prevents multiple
+loads all live objects into memory and has no compaction. An operating-system
+lock prevents multiple
 processes from opening one database root. Pagination limits HTTP response
 sizes. Offset pages remain available; ID cursors are preferable for long-lived
 message timelines.

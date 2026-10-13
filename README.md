@@ -24,11 +24,11 @@ CMake fetches cpp-httplib, nlohmann/json, and GoogleTest (GoogleTest only when
 ## Run
 
 ```powershell
-.\build\Debug\minidb.exe --db-dir data --max-file-size 67108864
+.\build\Debug\minidb.exe --db-dir data
 ```
 
-`--db-dir` and `--max-file-size` are required. The directory is the root for
-all databases; each database has its own subdirectory and segment-size limit.
+`--db-dir` is required and is the root for all databases. Each database stores
+its schema and maximum number of newly created objects per segment in metadata.
 Use `--help` for all options or `--version` for the executable version.
 
 ## Databases and generated IDs
@@ -40,10 +40,10 @@ underscores.
 ```powershell
 curl.exe -X POST http://127.0.0.1:8080/databases `
   -H "Content-Type: application/json" `
-  --data '{"name":"users"}'
+  --data '{"name":"users","maximum_objects_per_segment":10000,"schema":{"type":"object","properties":{"id":{"type":"string"},"username":{"type":"string"},"email":{"type":"string"},"friends":{"type":"array","items":{"type":"integer"}}},"required":["username"]}}'
 curl.exe -X POST http://127.0.0.1:8080/databases `
   -H "Content-Type: application/json" `
-  --data '{"name":"messages"}'
+  --data '{"name":"messages","maximum_objects_per_segment":100000,"schema":{"type":"object","properties":{"conversation_id":{"type":"integer"},"sender_id":{"type":"integer"},"text":{"type":"string"},"created_at":{"type":"string"}},"required":["conversation_id","sender_id","text","created_at"]}}'
 curl.exe http://127.0.0.1:8080/databases
 ```
 
@@ -88,14 +88,21 @@ boolean `true` are distinct indexed values. See the
 [HTTP API guide](docs/http-api.md) for request/response examples in multiple
 languages.
 
+Every database has its own object schema. A create or update must satisfy the
+schema's required fields and types; undeclared fields are rejected. The schema
+can be changed with `PUT /databases/{name}/schema` only if every current object
+passes the proposed schema.
+
 ## Data files and performance
 
 For database name `users`, the directory contains a metadata file
-`data/users/users.manifest.json` and bounded append-only segment files such as
-`data/users/users.segment-00000000.minidb`. The manifest records the segment
-list, size limit, and next ID. When the active segment cannot fit the next
-record, the storage creates a new segment and updates the manifest. The
-selected size limit must be the same each time the database is opened.
+`data/users/users.manifest.json` and append-only segment files such as
+`data/users/users.segment-00000000.minidb`. The manifest records the schema,
+objects-per-segment limit, segment list, and next ID. A segment header stores
+the number of objects first created in that segment; reaching the configured
+count sends the next newly created object to another segment. Replacements and
+deletions do not consume that object count, so they can still increase the
+physical bytes in a segment.
 
 Deleting a database without a query option moves it into `data/.archive/`;
 `POST /databases/{name}/restore` brings it back. Use

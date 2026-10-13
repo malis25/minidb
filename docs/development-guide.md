@@ -1,7 +1,7 @@
 # Development Guide
 
 This guide describes how to build, test, debug, and extend MiniDB on Windows
-with CMake and Visual Studio Code.
+with CMake.
 
 ## Prerequisites
 
@@ -9,7 +9,6 @@ with CMake and Visual Studio Code.
 - A C++20-capable compiler and its build tools
 - Git and an internet connection for the first configure: CMake fetches
   cpp-httplib and nlohmann/json; GoogleTest is fetched when tests are enabled
-- Visual Studio Code with the recommended CMake Tools and C/C++ extensions
 
 ## Configure, build, and test
 
@@ -34,9 +33,8 @@ $files = (Get-ChildItem app -Include *.cpp,*.h -File -Recurse | ForEach-Object F
 clang-format -i $files
 ```
 
-Visual Studio Code formats C++ files on save when the recommended C/C++
-extension is installed. Use the same `.clang-format` file for command-line and
-editor formatting.
+Use the checked-in `.clang-format` file for both command-line and editor
+formatting.
 
 If generated project files become stale after changing targets, configure the
 existing `build/` directory again. It is generated output and ignored by Git;
@@ -47,12 +45,10 @@ do not put source files or user database files there.
 ```powershell
 .\build\Debug\minidb.exe --help
 .\build\Debug\minidb.exe --version
-.\build\Debug\minidb.exe --db-dir data --max-file-size 67108864
+.\build\Debug\minidb.exe --db-dir data
 ```
 
-Open the repository root in Visual Studio Code. CMake Tools configures the
-project on open. Select the `Debug` configuration, build the active target,
-and use CMake Tools' test explorer or run:
+Configure the `Debug` build, then build the active target and run the tests:
 
 ```powershell
 ctest --test-dir build -C Debug --output-on-failure
@@ -72,8 +68,8 @@ into `minidb_core`.
    supports exact equality on each top-level property. Nested field paths,
    array membership, and range queries are not implemented.
 4. Reads return immutable shared snapshots. `ObjectStorage` isolates the core
-   from persistence; `SegmentedStorage` writes a manifest plus bounded,
-   append-only data segments.
+   from persistence; `SegmentedStorage` writes a manifest plus append-only data
+   segments capped by the count of newly created objects.
 5. A storage mutation completes before `Database` publishes the new value.
    Persistence errors are surfaced to the caller.
 
@@ -103,22 +99,25 @@ property inside `user` is not interpreted as the database ID. `get` returns an
 immutable shared object or an empty pointer when the ID is missing. The
 default-constructed database above is in-memory only. To persist objects,
 construct it with `std::make_unique<minidb::SegmentedStorage>(directory,
-database_name, max_segment_bytes)`. The server reads these settings from the required `--db-dir` and
-`--max-file-size` arguments. Databases are created by `POST /databases`.
+database_name, maximum_objects_per_segment, schema)`. The server reads the
+database root from `--db-dir`. Each database's schema and
+`maximum_objects_per_segment` are set on `POST /databases`.
 
 ## Run the HTTP server
 
 ```powershell
-.\build\Debug\minidb.exe --port 8080 --db-dir data --max-file-size 67108864
+.\build\Debug\minidb.exe --port 8080 --db-dir data
 ```
 
 The server provides database lifecycle endpoints under `/databases` and
 database-scoped object endpoints directly under `/databases/{name}`. Create a
-database using `POST /databases` with `{"name":"users"}` before using its object
-API. `GET /databases/{name}` lists IDs, `POST /databases/{name}` creates an
-object, `GET /databases/{name}/info` returns database metadata, and
-`POST /databases/{name}/query` searches object properties. IDs are independent
-per database. ID lists and equality queries accept
+database using `POST /databases` with its schema and segment object limit
+before using its object API. `GET /databases/{name}` lists IDs,
+`POST /databases/{name}` creates a schema-validated object,
+`GET|PUT /databases/{name}/schema` reads or updates its schema (only when all
+existing objects pass validation), and `POST /databases/{name}/batch` atomically
+applies related changes in that database. IDs are independent per database.
+ID lists and equality queries accept
 `limit` and `offset` query parameters (default page size 100, maximum 1000).
 Deleting a database archives its files by default; use `?purge=true` only for
 permanent removal. The server binds to `127.0.0.1`.
@@ -127,7 +126,7 @@ Use a separate temporary data directory when manually exercising the API:
 
 ```powershell
 .\build\Debug\minidb.exe --port 8080 `
-    --db-dir $env:TEMP\minidb-http-data --max-file-size 67108864
+    --db-dir $env:TEMP\minidb-http-data
 ```
 
 Request logs are opt-in with `--log-requests`; `--log-details` also prints

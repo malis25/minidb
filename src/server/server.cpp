@@ -43,7 +43,7 @@ int minidb::server::run(int argc, char* argv[]) {
         }
         const auto& options = *parsed_options;
 
-        DatabaseCatalog catalog{options.database_directory, options.maximum_file_size};
+        DatabaseCatalog catalog{options.database_directory};
 
         httplib::Server server;
         server.set_payload_max_length(maximum_request_size);
@@ -63,9 +63,7 @@ int minidb::server::run(int argc, char* argv[]) {
         }
 
         std::cout << "MiniDB HTTP API listening on http://" << listen_address << ':' << options.port
-                  << "\nDatabase root: " << options.database_directory.string()
-                  << "\nMaximum segment size: " << options.maximum_file_size << " bytes"
-                  << std::endl;
+                  << "\nDatabase root: " << options.database_directory.string() << std::endl;
         if (!server.listen_after_bind()) {
             throw std::runtime_error("HTTP server stopped unexpectedly.");
         }

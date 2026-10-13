@@ -1,8 +1,7 @@
 # Metadata and Segment File Format
 
-The database uses one metadata manifest and a sequence of bounded
-append-only data segments. The database name is a filename prefix, not a
-database file itself.
+The database uses one metadata manifest and a sequence of append-only data
+segments. The database name is a filename prefix, not a database file itself.
 
 For `--db-dir data` and the database name `users`, the storage creates:
 
@@ -28,11 +27,11 @@ reserved `.archive` directory contains logically deleted databases whose files
 are retained for possible restoration. Database names start with a lowercase
 letter and then contain only lowercase letters, digits, hyphens, or
 underscores. The manifest is the per-database catalog: it records the format
-version, configured maximum segment size, next numeric object ID, and ordered
-segment filenames. Segment names are generated and validated in sequence; the
-manifest cannot select an arbitrary path. A missing manifest while segment
-files remain is an error, not an instruction to overwrite or silently
-reinitialize data.
+version, object schema, maximum number of newly created objects per segment,
+next numeric object ID, and ordered segment filenames. Segment names are
+generated and validated in sequence; the manifest cannot select an arbitrary
+path. A missing manifest while segment files remain is an error, not an
+instruction to overwrite or silently reinitialize data.
 
 ## Manifest
 
@@ -41,8 +40,16 @@ replaced. Its logical shape is:
 
 ```json
 {
-  "format": "MINIDB-MANIFEST-2",
-  "maximum_segment_size": 67108864,
+  "format": "MINIDB-MANIFEST-3",
+  "maximum_objects_per_segment": 10000,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "username": {"type": "string"},
+      "email": {"type": "string"}
+    },
+    "required": ["username", "email"]
+  },
   "next_id": 5,
   "segments": [
     "users.segment-00000000.minidb",
@@ -51,18 +58,19 @@ replaced. Its logical shape is:
 }
 ```
 
-`next_id` is the ID to allocate for the next created object. It advances only
-after the object record has been appended. During recovery it is reconciled
-with IDs found in complete records, so a complete append followed by a crash
-before manifest replacement cannot cause an ID to be reused. If the configured
-segment limit differs from the manifest, startup fails; reopen with the
-original limit.
+`next_id` is the ID to allocate for the next created object. The schema is
+enforced for all new and replaced objects. The positive object-count limit is
+chosen when creating the database and is thereafter stored in metadata.
 
 ## Segment records
 
-Every segment begins with the eight-byte signature `MINIDB2` followed by a
-zero byte. Records follow until end-of-file. Each record starts with an
-unsigned 64-bit little-endian payload length.
+Every current segment begins with the eight-byte signature `MINIDB3` followed
+by a zero byte. The remaining 48-byte header contains two counter slots; each
+slot stores a generation, the number of IDs first created in this segment, and
+a checksum. The newest valid slot is used, so an interrupted header update
+leaves the preceding slot available. Records follow the 56-byte header until
+end-of-file. Each record starts with an unsigned 64-bit little-endian payload
+length.
 
 | Payload | Encoding |
 |---|---|
@@ -71,30 +79,31 @@ unsigned 64-bit little-endian payload length.
 | Object byte length | Unsigned 64-bit little-endian length; `S` records only |
 | Object | UTF-8 JSON object bytes; `S` records only |
 
-`T` records are enabled by manifest format 2 and use a reserved zero object
+`T` records were introduced by manifest format 2 and use a reserved zero object
 ID, followed by an unsigned 64-bit operation count. The payload then contains
 that many inline operations: `S`, object ID, object byte length, and JSON
 object bytes, or `E` and object ID. The operation count and payload must match
 exactly.
 
 Records are replayed in segment order and file order. A later store replaces
-the same ID; an erase removes it. All data segments have the same maximum byte
-limit, including their eight-byte signature. A record is never split between
-files. A batch is one record to keep its changes atomic and must fit in a single
-segment. If a record will not fit in the active segment, a new empty segment
-file is created, added to the manifest, and only then used for the record. An
-object too large to fit in an empty segment is rejected.
+the same ID; an erase removes it. A record is never split between files. Each
+newly created ID consumes one slot in the current segment; reaching the
+configured count creates and registers a new segment before writing the next
+new object. Replacements and deletes do not consume this count, so they may
+continue to grow the physical segment in bytes. Batches count each newly
+created ID and remain a single atomic record.
 
 ## Recovery and validation
 
-Startup validates the manifest, segment sequence, signatures, record sizes,
-operations, IDs, and JSON objects. A complete malformed record causes startup
-to fail. An incomplete record at the end of the final segment is truncated to
-the start of that record; earlier complete records remain available. An
-incomplete record in an earlier segment is an error. A missing manifest-listed
-segment is an error unless it is the sole initial segment and the manifest
-still has `next_id` zero; only that provably empty initialization state can be
-safely recreated.
+Startup validates the manifest, segment sequence, signatures, header slots,
+record sizes, operations, IDs, JSON objects, and schema conformance. A complete
+malformed record causes startup to fail. An incomplete record at the end of
+the final segment is truncated to the start of that record; an incomplete
+record in an earlier segment is an error. The segment object count is reconciled
+while records are already being replayed. A missing manifest-listed segment is
+an error unless it is the sole initial segment and the manifest still has
+`next_id` zero; only that provably empty initialization state can be safely
+recreated.
 
 When a new segment is needed, the empty file is created before the manifest is
 updated, and the record is appended only after both steps succeed. If a crash
@@ -105,26 +114,29 @@ ignored.
 
 If the process stops after appending a complete new-object record but before
 persisting the advanced `next_id`, recovery finds that ID while scanning and
-advances the counter. If the process stops before a complete append, the
-incomplete bytes are removed and the ID may safely be used on the next create.
+advances the counter. If the process stops before a complete append, incomplete
+bytes are removed and the ID may safely be used on the next create.
 
 ## Limits and migration
 
-Manifest format 2 adds the `T` batch record. This version reads format-1
-manifests and upgrades them when writing format-2 metadata; it writes the
-format-2 manifest before appending a batch, so older binaries reject the
-database rather than misreading a batch record. The previous `MINIOBJ1`
-single-file prototype and `MINIDB1` key/value snapshot formats are not
-compatible with this segmented format. Keep a backup before using data with a
-different MiniDB version. The manifest and segments currently have no checksum
-or migration tool.
+Manifest format 3 adds the schema, object-count limit, and `MINIDB3` headers.
+Format-1 and format-2 databases are migrated on startup: legacy segments are
+rewritten with the new header, and a compatibility schema that permits existing
+property names plus a default count limit of 10000 is added. If a legacy
+segment already contains more objects than that default, the migrated count
+limit is raised to at least that segment's existing count. Set an explicit
+strict schema with the schema API after verifying all current objects. Back up
+the database before upgrading. The previous `MINIOBJ1` single-file prototype
+and `MINIDB1` key/value snapshot formats are not compatible with this segmented
+format.
 
 Segments are append-only and are not compacted. Updates and deletes therefore
-continue to consume space, and removed values remain in older records until a
-future compaction feature is implemented. All live objects and their indexes
-are loaded into memory. Only one process may use a database directory at a
-time. An operating-system lock file prevents concurrent server processes from
-opening the same database root.
+continue to consume disk space even though they do not consume the new-object
+quota; removed values remain in older records. The object-count limit is not a
+physical byte-size ceiling. All live objects and their indexes are loaded into
+memory. Only one process may use a database directory at a time. An
+operating-system lock file prevents concurrent server processes from opening
+the same database root.
 
 Each record is flushed before success is reported, but this is not a guarantee
 against all power-loss or storage-device failures. The current object API is

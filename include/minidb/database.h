@@ -58,6 +58,9 @@ class Database {
     // Apply a set of creates/replacements/deletes as one persistent operation.
     [[nodiscard]] std::vector<std::uint64_t>
     apply_batch(const std::vector<ObjectMutation>& mutations);
+    void update_schema(ObjectSchema schema);
+    [[nodiscard]] const ObjectSchema& schema() const noexcept;
+    [[nodiscard]] std::uint64_t maximum_objects_per_segment() const noexcept;
 
     [[nodiscard]] std::shared_ptr<const Object> get(std::uint64_t id) const;
     [[nodiscard]] bool remove(std::uint64_t id);
@@ -97,6 +100,9 @@ class Database {
     std::set<std::uint64_t> ordered_ids_;
     FieldIndex field_index_;
     std::unique_ptr<ObjectStorage> storage_;
+    ObjectSchema schema_ = {
+        {"type", "object"}, {"properties", Object::object()}, {"additionalProperties", true}};
+    std::uint64_t maximum_objects_per_segment_ = 0;
     std::uint64_t next_id_ = 0;
 };
 

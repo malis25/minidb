@@ -1,7 +1,6 @@
 #include "server_options.h" // Command-line configuration for the HTTP service.
 
 #include <charconv>
-#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -21,21 +20,11 @@ int parse_port(std::string_view value) {
     return port;
 }
 
-std::uint64_t parse_file_size(std::string_view value) {
-    std::uint64_t size = 0;
-    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), size);
-    if (error != std::errc{} || end != value.data() + value.size() || size == 0) {
-        throw std::runtime_error("--max-file-size must be a positive integer number of bytes.");
-    }
-    return size;
-}
-
 void print_help() {
     std::cout << "Usage: minidb [--port PORT] --db-dir DIRECTORY "
-                 "--max-file-size BYTES [--log-requests | --log-details]\n"
+                 "[--log-requests | --log-details]\n"
                  "  --port PORT       Port to listen on (default: 8080)\n"
                  "  --db-dir DIRECTORY Root directory for all databases\n"
-                 "  --max-file-size N Maximum segment file size in bytes (required)\n"
                  "  --log-requests    Log request method, path, and response status\n"
                  "  --log-details     Also log request and response bodies\n"
                  "HTTP API listens on 127.0.0.1 only.\n";
@@ -58,8 +47,6 @@ std::optional<ServerOptions> parse_server_options(int argc, char* argv[]) {
             options.port = parse_port(argv[++index]);
         } else if (argument == "--db-dir" && index + 1 < argc) {
             options.database_directory = argv[++index];
-        } else if (argument == "--max-file-size" && index + 1 < argc) {
-            options.maximum_file_size = parse_file_size(argv[++index]);
         } else if (argument == "--log-requests") {
             options.log_requests = true;
         } else if (argument == "--log-details") {
@@ -73,9 +60,5 @@ std::optional<ServerOptions> parse_server_options(int argc, char* argv[]) {
     if (options.database_directory.empty()) {
         throw std::runtime_error("Required argument missing: --db-dir DIRECTORY.");
     }
-    if (options.maximum_file_size == 0) {
-        throw std::runtime_error("Required argument missing: --max-file-size BYTES.");
-    }
-
     return options;
 }
