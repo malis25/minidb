@@ -5,6 +5,12 @@ add_library(minidb_server
     server_options.cpp
     database_catalog.cpp
     database_api.cpp
+    api_databases.cpp
+    api_schema.cpp
+    api_indexes.cpp
+    api_objects.cpp
+    http_util.cpp
+    origin_policy.cpp
     request_logging.cpp
 )
 add_library(minidb::server ALIAS minidb_server)

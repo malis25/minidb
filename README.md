@@ -134,10 +134,13 @@ directory grows over time.
 ## Project structure and guides
 
 ```text
-app/                 Executable entry point and version implementation
-include/minidb/      Public object, database, and storage interfaces
-src/                 Database, secondary indexes, segmented storage, HTTP server
-tests/unit/          Core unit and HTTP integration tests
+app/                     Executable entry point and version implementation
+include/minidb/          Public object, database, and storage interfaces
+src/core/                Database class and core query helpers
+src/index/                Disk-resident B+ tree index implementation
+src/storage/              Segmented object storage and internal helpers
+src/server/               HTTP server, database catalog, and API routes
+tests/unit/              Core unit and HTTP integration tests
 docs/                API, object model, architecture, and format guides
 data/                Local database files (ignored by Git)
 ```

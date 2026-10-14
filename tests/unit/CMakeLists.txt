@@ -2,6 +2,11 @@
 add_executable(minidb_unit_tests
     bplus_tree_tests.cpp
     database_tests.cpp
+    database_query_tests.cpp
+    database_schema_tests.cpp
+    database_migration_tests.cpp
+    segmented_storage_tests.cpp
+    segmented_storage_recovery_tests.cpp
     version_tests.cpp
     ${PROJECT_SOURCE_DIR}/app/version.cpp
 )
@@ -15,7 +20,10 @@ include(GoogleTest)
 gtest_discover_tests(minidb_unit_tests)
 
 add_executable(minidb_http_tests
-    http_api_tests.cpp
+    http_database_tests.cpp
+    http_object_tests.cpp
+    http_schema_tests.cpp
+    http_security_tests.cpp
 )
 target_link_libraries(minidb_http_tests
     PRIVATE
