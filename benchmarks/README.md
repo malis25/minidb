@@ -90,3 +90,45 @@ The plot script reads the Debug and Release JSON files and writes
 block size). The chosen default is `default_next_id_reservation = 128`: measured
 throughput reaches ~98% of its asymptote by 128 in both Debug and Release, while
 larger blocks add only noise-level gains and skip more IDs after an unclean stop.
+
+## Concurrent-client stress sweep
+
+`minidb_concurrency_bench` is a third harness. Unlike `minidb_bench` (one
+sequential client), it hammers the same in-process HTTP API from many client
+threads at once and sweeps the number of concurrent clients, so it shows how
+throughput and request latency behave as load rises past the machine's core
+count. Each phase runs for a fixed wall-clock duration with every client issuing
+requests as fast as it can:
+
+```powershell
+cmake --build build --config Debug --target minidb_concurrency_bench
+.\build\benchmarks\Debug\minidb_concurrency_bench.exe `
+    --objects 1000 --seconds 2 --peak-seconds 8 --levels 1,2,4,8,16,32,64,128 `
+    --keep-alive --worker-pool 128 --out benchmarks/results/concurrency-1.json
+python benchmarks/plot_concurrency.py
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--objects N` | 2000 | Objects created per configuration before the sweep |
+| `--seconds S` | 3 | Duration of each sweep phase in seconds |
+| `--peak-seconds P` | 10 | Duration of the sustained mixed peak phase |
+| `--levels a,b,c` | `1,2,4,8,16,32,64,128` | Concurrent client counts to sweep |
+| `--keep-alive` | off | Reuse one connection per client instead of one per request |
+| `--worker-pool N` | http-lib default | Server worker-pool size (`max(8, hardware-1)`) |
+| `--port P` | 0 | Fixed port to bind; `0` picks a free ephemeral port |
+| `--out PATH` | `benchmarks/results/concurrency.json` | JSON output path |
+
+The three workloads are `read` (GET by id), `create` (POST) and `mixed`
+(70% read, 15% indexed-email query, 10% update, 5% create). Objects created by a
+`create`/`mixed` phase are deleted again so later phases start from the same
+baseline. Because http-lib's default worker pool
+(`max(8, hardware-1)`) caps how many keep-alive connections can be held at once,
+`--worker-pool` enlarges it so the sweep measures the database layer rather than
+that transport limit.
+
+`plot_concurrency.py` reads one or more JSON files, keeps the best
+(highest-throughput) run for each point, and writes
+`benchmarks/results/concurrency-scaling.png`: a 2x3 grid of throughput (top) and
+tail latency (bottom, p95 solid / p99 dashed) against concurrent clients, one
+column per workload.

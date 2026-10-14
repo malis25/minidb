@@ -20,3 +20,15 @@ target_link_libraries(minidb_write_bench
         nlohmann_json::nlohmann_json
 )
 minidb_set_compiler_warnings(minidb_write_bench)
+
+# A concurrent-client stress benchmark that drives the HTTP API from many
+# simultaneous client threads and sweeps the client count, so it characterises
+# throughput and latency under load rather than one request at a time.
+add_executable(minidb_concurrency_bench concurrency_benchmark_main.cpp)
+target_link_libraries(minidb_concurrency_bench
+    PRIVATE
+        minidb::server
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+)
+minidb_set_compiler_warnings(minidb_concurrency_bench)
