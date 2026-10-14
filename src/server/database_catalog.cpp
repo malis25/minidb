@@ -114,6 +114,63 @@ bool is_real_directory(const std::filesystem::directory_entry& entry) {
 ManagedDatabase::ManagedDatabase(std::unique_ptr<minidb::ObjectStorage> storage)
     : database(std::move(storage)) {}
 
+ManagedDatabase::~ManagedDatabase() {
+    stop_schema_migration();
+}
+
+void ManagedDatabase::start_schema_migration() {
+    // A joinable worker at this point has finished its previous migration: a new
+    // one is only started after the previous one completed, and the worker never
+    // takes `mutex` again once it has finished. Reap it so the member is reusable.
+    if (migration_thread_.joinable()) {
+        migration_thread_.join();
+    }
+    migration_stop_ = false;
+    migration_thread_ = std::thread([this] { run_schema_migration(); });
+}
+
+void ManagedDatabase::signal_schema_migration_stop() {
+    migration_stop_ = true;
+}
+
+void ManagedDatabase::join_schema_migration() {
+    if (migration_thread_.joinable()) {
+        migration_thread_.join();
+    }
+}
+
+void ManagedDatabase::stop_schema_migration() {
+    {
+        std::lock_guard lock(mutex);
+        migration_stop_ = true;
+    }
+    join_schema_migration();
+}
+
+void ManagedDatabase::run_schema_migration() {
+    constexpr std::size_t chunk_size = 128;
+    while (true) {
+        std::size_t remaining = 0;
+        {
+            std::lock_guard lock(mutex);
+            if (migration_stop_) {
+                return;
+            }
+            try {
+                remaining = database.migrate_schema_chunk(chunk_size);
+            } catch (...) {
+                // Leave the migration pending: the manifest still records it, so
+                // a later run or a restart finishes it once the failure clears.
+                return;
+            }
+        }
+        if (remaining == 0) {
+            return;
+        }
+        std::this_thread::yield();
+    }
+}
+
 DatabaseCatalog::DatabaseCatalog(std::filesystem::path root_directory,
                                  std::uint64_t default_cache_bytes)
     : root_directory_(std::move(root_directory)), archive_directory_(root_directory_ / ".archive"),
@@ -227,7 +284,6 @@ DatabaseCatalog::RemoveResult DatabaseCatalog::remove(const std::string& name, b
 
     const auto active_directory = root_directory_ / name;
     const auto managed_database = database->second;
-    std::lock_guard database_lock(managed_database->mutex);
 
     std::filesystem::path archive_directory;
     if (!purge) {
@@ -241,10 +297,20 @@ DatabaseCatalog::RemoveResult DatabaseCatalog::remove(const std::string& name, b
         }
     }
 
-    // Close any open index files before moving or deleting the directory:
-    // Windows refuses to rename or remove a directory that still has open files.
-    managed_database->active = false;
-    managed_database->database.close();
+    // Stop background schema adaptation before closing: the worker must not
+    // touch storage once its files are closed or its directory moves. The stop
+    // is signalled while holding `mutex` (so the worker observes it before it
+    // does more work), and joined after releasing it (so the join cannot
+    // deadlock on a worker waiting for `mutex`).
+    {
+        std::lock_guard database_lock(managed_database->mutex);
+        // Close any open index files before moving or deleting the directory:
+        // Windows refuses to rename or remove a directory that still has open files.
+        managed_database->active = false;
+        managed_database->signal_schema_migration_stop();
+        managed_database->database.close();
+    }
+    managed_database->join_schema_migration();
 
     if (purge) {
         std::error_code error;

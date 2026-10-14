@@ -36,6 +36,13 @@ void send_error(httplib::Response& response, const std::string& message, int sta
     send_json(response, {{"error", message}}, status);
 }
 
+nlohmann::json migration_status_json(const minidb::Database::SchemaMigrationStatus& status) {
+    return {{"pending", status.pending},
+            {"total", status.total},
+            {"processed", status.processed},
+            {"remaining", status.total - status.processed}};
+}
+
 bool has_json_content_type(const httplib::Request& request) {
     if (!request.has_header("Content-Type") ||
         request.get_header_value_count("Content-Type") != 1) {
@@ -512,7 +519,8 @@ void DatabaseApi::register_routes(httplib::Server& server) {
             response,
             {{"name", name},
              {"schema", database->database.schema()},
-             {"maximum_objects_per_segment", database->database.maximum_objects_per_segment()}},
+             {"maximum_objects_per_segment", database->database.maximum_objects_per_segment()},
+             {"migration", migration_status_json(database->database.schema_migration_status())}},
             httplib::StatusCode::OK_200);
     });
 
@@ -539,20 +547,48 @@ void DatabaseApi::register_routes(httplib::Server& server) {
         if (!database) {
             return;
         }
-        std::lock_guard lock(database->mutex);
-        if (!is_active(database, name, response)) {
-            return;
+        bool migration_pending = false;
+        nlohmann::json updated_schema;
+        nlohmann::json migration;
+        {
+            std::lock_guard lock(database->mutex);
+            if (!is_active(database, name, response)) {
+                return;
+            }
+            try {
+                database->database.begin_schema_migration(std::move(schema));
+                // Adapt the first chunk inline so small databases finish before
+                // the response is sent and the caller sees a completed update.
+                static_cast<void>(database->database.migrate_schema_chunk(128));
+                const auto status = database->database.schema_migration_status();
+                migration_pending = status.pending;
+                updated_schema = database->database.schema();
+                migration = migration_status_json(status);
+            } catch (const std::invalid_argument& error) {
+                send_error(response, error.what(), httplib::StatusCode::BadRequest_400);
+                return;
+            } catch (const std::logic_error& error) {
+                send_error(response, error.what(), httplib::StatusCode::Conflict_409);
+                return;
+            } catch (const std::exception& error) {
+                send_error(response, error.what(),
+                           httplib::StatusCode::InternalServerError_500);
+                return;
+            }
+            // Start the worker while still holding `mutex`; it only takes that
+            // same lock between chunks, and a running worker is always finished
+            // when a new migration begins, so this cannot deadlock.
+            if (migration_pending) {
+                database->start_schema_migration();
+            }
         }
-        try {
-            database->database.update_schema(std::move(schema));
-            send_json(response,
-                      {{"name", name}, {"schema", database->database.schema()}, {"updated", true}},
-                      httplib::StatusCode::OK_200);
-        } catch (const std::invalid_argument& error) {
-            send_error(response, error.what(), httplib::StatusCode::Conflict_409);
-        } catch (const std::exception& error) {
-            send_error(response, error.what(), httplib::StatusCode::InternalServerError_500);
-        }
+        send_json(response,
+                  {{"name", name},
+                   {"schema", updated_schema},
+                   {"updated", true},
+                   {"migration", migration}},
+                  migration_pending ? httplib::StatusCode::Accepted_202
+                                    : httplib::StatusCode::OK_200);
     });
 
     server.Get("/databases/:name/indexes", [this](const httplib::Request& request,
@@ -644,7 +680,9 @@ void DatabaseApi::register_routes(httplib::Server& server) {
                               {"object_count", database->database.size()},
                               {"next_id", database->database.next_id()},
                               {"disk_backed", database->database.disk_backed()},
-                              {"indexed_fields", database->database.indexed_fields()}},
+                              {"indexed_fields", database->database.indexed_fields()},
+                              {"migration",
+                               migration_status_json(database->database.schema_migration_status())}},
                              httplib::StatusCode::OK_200);
                });
 

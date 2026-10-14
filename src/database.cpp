@@ -45,6 +45,7 @@ Database::Database(std::unique_ptr<ObjectStorage> storage) : storage_(std::move(
         }
         maximum_objects_per_segment_ = snapshot.maximum_objects_per_segment;
     }
+    const bool recovery = snapshot.schema_migration_pending;
     if (snapshot.disk_backed) {
         ordered_ids_.insert(snapshot.object_ids.begin(), snapshot.object_ids.end());
         for (const auto id : snapshot.object_ids) {
@@ -52,30 +53,59 @@ Database::Database(std::unique_ptr<ObjectStorage> storage) : storage_(std::move(
                 next_id_ = id + 1;
             }
         }
-        return;
+    } else {
+        objects_.reserve(snapshot.objects.size());
+        for (auto& stored : snapshot.objects) {
+            if (!stored.object.is_object()) {
+                throw std::runtime_error("Storage returned an invalid database object.");
+            }
+            if (!recovery) {
+                std::string validation_error;
+                if (!validate_object_against_schema(stored.object, schema_, &validation_error)) {
+                    throw std::runtime_error("Stored object does not match the database schema: " +
+                                             validation_error);
+                }
+            }
+            if (stored.id >= next_id_ && stored.id != std::numeric_limits<std::uint64_t>::max()) {
+                next_id_ = stored.id + 1;
+            } else if (stored.id == std::numeric_limits<std::uint64_t>::max()) {
+                next_id_ = stored.id;
+            }
+            const auto [entry, inserted] = objects_.emplace(
+                stored.id, std::make_shared<const Object>(std::move(stored.object)));
+            if (!inserted) {
+                throw std::runtime_error("Storage returned duplicate object IDs.");
+            }
+            ordered_ids_.insert(entry->first);
+            add_to_index(entry->first, *entry->second);
+        }
     }
-    objects_.reserve(snapshot.objects.size());
-    for (auto& stored : snapshot.objects) {
-        if (!stored.object.is_object()) {
-            throw std::runtime_error("Storage returned an invalid database object.");
+
+    if (recovery) {
+        // A previous run updated the schema but stopped before adapting every
+        // object. Finish it now: no other thread can reach the database while it
+        // is being constructed, so a synchronous run is safe here.
+        migration_cursor_.reset();
+        migration_limit_id_ = ordered_ids_.empty() ? 0 : *ordered_ids_.rbegin();
+        migration_total_ = ordered_ids_.size();
+        migration_processed_ = 0;
+        migration_pending_ = !ordered_ids_.empty();
+        while (migration_pending_) {
+            static_cast<void>(migrate_schema_chunk(128));
         }
-        std::string validation_error;
-        if (!validate_object_against_schema(stored.object, schema_, &validation_error)) {
-            throw std::runtime_error("Stored object does not match the database schema: " +
-                                     validation_error);
+        if (storage_) {
+            storage_->set_schema_migration_pending(false);
         }
-        if (stored.id >= next_id_ && stored.id != std::numeric_limits<std::uint64_t>::max()) {
-            next_id_ = stored.id + 1;
-        } else if (stored.id == std::numeric_limits<std::uint64_t>::max()) {
-            next_id_ = stored.id;
+        if (!snapshot.disk_backed) {
+            std::string validation_error;
+            for (const auto& [id, object] : objects_) {
+                static_cast<void>(id);
+                if (!validate_object_against_schema(*object, schema_, &validation_error)) {
+                    throw std::runtime_error("Stored object does not match the database schema: " +
+                                             validation_error);
+                }
+            }
         }
-        const auto [entry, inserted] =
-            objects_.emplace(stored.id, std::make_shared<const Object>(std::move(stored.object)));
-        if (!inserted) {
-            throw std::runtime_error("Storage returned duplicate object IDs.");
-        }
-        ordered_ids_.insert(entry->first);
-        add_to_index(entry->first, *entry->second);
     }
 }
 
@@ -204,8 +234,12 @@ std::vector<std::uint64_t> Database::apply_batch(const std::vector<ObjectMutatio
 }
 
 void Database::update_schema(ObjectSchema schema) {
+    if (migration_pending_) {
+        throw std::logic_error("A schema migration is already in progress.");
+    }
     std::string schema_error;
-    if (!validate_object_schema(schema, &schema_error)) {
+    if (!validate_object_schema(schema, &schema_error) ||
+        !validate_schema_defaults(schema, &schema_error)) {
         throw std::invalid_argument(schema_error);
     }
     if (disk_backed()) {
@@ -232,6 +266,88 @@ void Database::update_schema(ObjectSchema schema) {
         storage_->update_schema(schema);
     }
     schema_ = std::move(schema);
+}
+
+void Database::begin_schema_migration(ObjectSchema schema) {
+    std::string schema_error;
+    if (!validate_object_schema(schema, &schema_error) ||
+        !validate_schema_defaults(schema, &schema_error)) {
+        throw std::invalid_argument(schema_error);
+    }
+    if (migration_pending_) {
+        throw std::logic_error("A schema migration is already in progress.");
+    }
+    if (storage_) {
+        // Mark the migration pending before persisting the schema, so a crash at
+        // any point leaves a manifest whose schema and pending flag are
+        // consistent: recovery adapts objects to whichever schema is persisted.
+        if (!ordered_ids_.empty()) {
+            storage_->set_schema_migration_pending(true);
+        }
+        storage_->update_schema(schema);
+    }
+    schema_ = std::move(schema);
+    migration_cursor_.reset();
+    migration_limit_id_ = ordered_ids_.empty() ? 0 : *ordered_ids_.rbegin();
+    migration_total_ = ordered_ids_.size();
+    migration_processed_ = 0;
+    migration_pending_ = !ordered_ids_.empty();
+    if (storage_ && !migration_pending_) {
+        storage_->set_schema_migration_pending(false);
+    }
+}
+
+std::size_t Database::migrate_schema_chunk(std::size_t limit) {
+    if (!migration_pending_ || limit == 0) {
+        return migration_pending_ ? migration_total_ - migration_processed_ : 0;
+    }
+    std::vector<ObjectMutation> replacements;
+    replacements.reserve(limit);
+    std::optional<std::uint64_t> candidate_cursor;
+    std::size_t examined = 0;
+    auto id = migration_cursor_ ? ordered_ids_.upper_bound(*migration_cursor_) : ordered_ids_.begin();
+    while (id != ordered_ids_.end() && examined < limit && *id <= migration_limit_id_) {
+        const auto current = *id++;
+        ++examined;
+        candidate_cursor = current;
+        const auto object = get(current);
+        if (object == nullptr) {
+            continue;
+        }
+        Object adapted = *object;
+        if (!adapt_value_to_schema(adapted, schema_)) {
+            throw std::logic_error("Schema adaptation could not make an object conform.");
+        }
+        if (adapted != *object) {
+            replacements.push_back({ObjectMutation::Type::replace, current, std::move(adapted)});
+        }
+    }
+    // Apply and only then advance the cursor, so a storage failure replays the
+    // same window instead of skipping objects that were never persisted.
+    if (!replacements.empty()) {
+        static_cast<void>(apply_batch(replacements));
+    }
+    if (candidate_cursor) {
+        migration_cursor_ = candidate_cursor;
+        migration_processed_ += examined;
+    }
+    const bool finished = (id == ordered_ids_.end()) || (*id > migration_limit_id_);
+    if (finished) {
+        migration_pending_ = false;
+        if (storage_) {
+            storage_->set_schema_migration_pending(false);
+        }
+        return 0;
+    }
+    return migration_total_ > migration_processed_ ? migration_total_ - migration_processed_ : 0;
+}
+
+Database::SchemaMigrationStatus Database::schema_migration_status() const noexcept {
+    SchemaMigrationStatus status;
+    status.pending = migration_pending_;
+    status.total = migration_total_;
+    status.processed = migration_processed_;
+    return status;
 }
 
 const ObjectSchema& Database::schema() const noexcept {

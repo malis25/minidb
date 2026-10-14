@@ -29,8 +29,9 @@ are retained for possible restoration. Database names start with a lowercase
 letter and then contain only lowercase letters, digits, hyphens, or
 underscores. The manifest is the per-database catalog: it records the format
 version, object schema, maximum number of newly created objects per segment,
-next numeric object ID, ordered segment filenames, the indexed field names, and
-the object-cache byte budget. Segment names are generated and validated in
+next numeric object ID, ordered segment filenames, the indexed field names, the
+object-cache byte budget, and whether a schema migration is still pending.
+Segment names are generated and validated in
 sequence; the manifest cannot select an arbitrary path. A missing manifest while
 segment files remain is an error, not an instruction to overwrite or silently
 reinitialize data.
@@ -54,6 +55,7 @@ replaced. Its logical shape is:
   },
   "indexed_fields": ["username"],
   "cache_bytes": 67108864,
+  "schema_migration_pending": false,
   "next_id": 5,
   "next_id_reservation": 128,
   "segments": [
@@ -75,6 +77,13 @@ stored value.
 The schema is enforced for all new and replaced objects. The positive
 object-count limit is chosen when creating the database and is thereafter stored
 in metadata.
+
+`schema_migration_pending` is `true` while existing objects still have to be
+adapted to the stored schema after a schema change. It is written before the new
+schema so that the schema and the flag are always consistent: if the process
+stops at any point, the next open completes the adaptation for whichever schema
+is persisted, then clears the flag. Older manifests that omit the field are read
+as `false`.
 
 `indexed_fields` lists the fields that have an on-disk B+ tree index.
 `cache_bytes` is the byte budget for the per-database in-memory object cache.

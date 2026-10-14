@@ -2,7 +2,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -97,6 +99,78 @@ using ObjectSchema = nlohmann::json;
     return validate_object_schema(schema) && strict_node(strict_node, schema);
 }
 
+// A JSON value matches a declared schema type. `null` is the explicit "unset"
+// value and satisfies every declared type, so a value that must be present can
+// still be represented before its field has a meaningful value.
+[[nodiscard]] inline bool json_value_matches_type(const Object& value, std::string_view type) {
+    if (value.is_null()) {
+        return true;
+    }
+    return (type == "object" && value.is_object()) || (type == "array" && value.is_array()) ||
+           (type == "string" && value.is_string()) ||
+           (type == "integer" && value.is_number_integer()) ||
+           (type == "number" && value.is_number()) || (type == "boolean" && value.is_boolean()) ||
+           (type == "null" && value.is_null());
+}
+
+// Validates one JSON value against a schema node. This is shared by whole-object
+// validation and by `default` validation so that a declared default must itself
+// be a valid instance of the property schema it belongs to.
+[[nodiscard]] inline bool validate_value_against_rule(const Object& value, const Object& rule,
+                                                      const std::string& path,
+                                                      std::string* error = nullptr) {
+    const auto type = rule["type"].get<std::string>();
+    if (!json_value_matches_type(value, type)) {
+        if (error != nullptr) {
+            *error = "Value at '" + path + "' must be of type " + type + ".";
+        }
+        return false;
+    }
+    if (value.is_null()) {
+        return true;
+    }
+    if (type == "object") {
+        const auto& properties = rule["properties"];
+        const bool allow_additional = rule.value("additionalProperties", false);
+        if (rule.contains("required")) {
+            for (const auto& required : rule["required"]) {
+                const auto& name = required.get_ref<const std::string&>();
+                if (!value.contains(name)) {
+                    if (error != nullptr) {
+                        *error = "Required property is missing: " + path + "." + name;
+                    }
+                    return false;
+                }
+            }
+        }
+        for (auto property = value.begin(); property != value.end(); ++property) {
+            if (!properties.contains(property.key())) {
+                if (allow_additional) {
+                    continue;
+                }
+                if (error != nullptr) {
+                    *error = "Property is not allowed by the schema: " + path + "." + property.key();
+                }
+                return false;
+            }
+            if (!validate_value_against_rule(property.value(), properties[property.key()],
+                                             path + "." + property.key(), error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (type == "array") {
+        for (std::size_t index = 0; index < value.size(); ++index) {
+            if (!validate_value_against_rule(value[index], rule["items"],
+                                             path + "[" + std::to_string(index) + "]", error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] inline bool validate_object_against_schema(const Object& object,
                                                          const ObjectSchema& schema,
                                                          std::string* error = nullptr) {
@@ -109,64 +183,95 @@ using ObjectSchema = nlohmann::json;
     if (!validate_object_schema(schema, error)) {
         return false;
     }
-    const auto validate_value = [&](const auto& self, const Object& value, const Object& rule,
-                                    const std::string& path) -> bool {
-        const auto type = rule["type"].get<std::string>();
-        const bool matches =
-            (type == "object" && value.is_object()) || (type == "array" && value.is_array()) ||
-            (type == "string" && value.is_string()) ||
-            (type == "integer" && value.is_number_integer()) ||
-            (type == "number" && value.is_number()) || (type == "boolean" && value.is_boolean()) ||
-            (type == "null" && value.is_null());
-        if (!matches) {
-            if (error != nullptr) {
-                *error = "Value at '" + path + "' must be of type " + type + ".";
-            }
+    return validate_value_against_rule(object, schema, "$", error);
+}
+
+// Rejects schemas whose `default` values are not valid instances of the node
+// that declares them. Schema adaptation copies defaults into existing objects,
+// so an invalid default would corrupt the database.
+[[nodiscard]] inline bool validate_schema_defaults(const ObjectSchema& schema,
+                                                   std::string* error = nullptr) {
+    const auto walk = [&](const auto& self, const Object& node, const std::string& path) -> bool {
+        if (node.contains("default") &&
+            !validate_value_against_rule(node["default"], node, path + ".default", error)) {
             return false;
         }
-        if (type == "object") {
-            const auto& properties = rule["properties"];
-            const bool allow_additional = rule.value("additionalProperties", false);
-            if (rule.contains("required")) {
-                for (const auto& required : rule["required"]) {
-                    const auto& name = required.get_ref<const std::string&>();
-                    if (!value.contains(name)) {
-                        if (error != nullptr) {
-                            *error = "Required property is missing: " + path + "." + name;
-                        }
-                        return false;
-                    }
-                }
-            }
-            for (auto property = value.begin(); property != value.end(); ++property) {
-                if (!properties.contains(property.key())) {
-                    if (allow_additional) {
-                        continue;
-                    }
-                    if (error != nullptr) {
-                        *error =
-                            "Property is not allowed by the schema: " + path + "." + property.key();
-                    }
-                    return false;
-                }
-                if (!self(self, property.value(), properties[property.key()],
-                          path + "." + property.key())) {
+        if (node["type"] == "object") {
+            for (auto property = node["properties"].begin(); property != node["properties"].end();
+                 ++property) {
+                if (!self(self, property.value(), path + "." + property.key())) {
                     return false;
                 }
             }
-            return true;
-        }
-        if (type == "array") {
-            for (std::size_t index = 0; index < value.size(); ++index) {
-                if (!self(self, value[index], rule["items"],
-                          path + "[" + std::to_string(index) + "]")) {
-                    return false;
-                }
+        } else if (node["type"] == "array") {
+            if (!self(self, node["items"], path + "[]")) {
+                return false;
             }
         }
         return true;
     };
-    return validate_value(validate_value, object, schema, "$");
+    return validate_object_schema(schema, error) && walk(walk, schema, "$");
+}
+
+// The value a newly declared property receives when an object is adapted to a
+// schema: the property's `default` when present, otherwise `null`.
+[[nodiscard]] inline Object schema_default_or_null(const Object& rule) {
+    if (rule.is_object() && rule.contains("default")) {
+        return rule["default"];
+    }
+    return Object();
+}
+
+// Adapts `value` in place so it satisfies `rule`:
+//   * a `null` value is left untouched (null already satisfies every type);
+//   * object properties the schema no longer declares are removed;
+//   * missing object properties are filled from the property's `default` or null;
+//   * a value that cannot satisfy its rule is replaced with the rule's default
+//     or null.
+// Returns true when the value satisfies the rule afterwards. The transformation
+// always succeeds so a schema migration never leaves a database half-adapted.
+[[nodiscard]] inline bool adapt_value_to_schema(Object& value, const Object& rule) {
+    if (value.is_null()) {
+        return true;
+    }
+    const auto type = rule["type"].get<std::string>();
+    if (type == "object") {
+        if (!value.is_object()) {
+            return false;
+        }
+        const auto& properties = rule["properties"];
+        for (auto property = value.begin(); property != value.end();) {
+            if (properties.contains(property.key())) {
+                ++property;
+            } else {
+                property = value.erase(property);
+            }
+        }
+        for (auto property = properties.begin(); property != properties.end(); ++property) {
+            const auto& name = property.key();
+            const auto& property_rule = property.value();
+            if (value.contains(name)) {
+                if (!adapt_value_to_schema(value[name], property_rule)) {
+                    value[name] = schema_default_or_null(property_rule);
+                }
+            } else {
+                value[name] = schema_default_or_null(property_rule);
+            }
+        }
+        return true;
+    }
+    if (type == "array") {
+        if (!value.is_array()) {
+            return false;
+        }
+        for (auto& element : value) {
+            if (!adapt_value_to_schema(element, rule["items"])) {
+                element = schema_default_or_null(rule["items"]);
+            }
+        }
+        return true;
+    }
+    return json_value_matches_type(value, type);
 }
 
 [[nodiscard]] inline bool is_within_object_nesting_depth(const Object& object) {

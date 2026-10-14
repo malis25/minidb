@@ -94,9 +94,11 @@ boolean `true` are distinct indexed values. See the
 languages.
 
 Every database has its own object schema. A create or update must satisfy the
-schema's required fields and types; undeclared fields are rejected. The schema
-can be changed with `PUT /databases/{name}/schema` only if every current object
-passes the proposed schema.
+schema's required fields and types; undeclared fields are rejected. A schema can
+be changed with `PUT /databases/{name}/schema`, which adapts existing objects to
+the new schema in the background so the database stays available: a newly added
+property is filled from its `default` (or `null`), a removed property is dropped,
+and a value the new schema disallows is replaced with the default (or `null`).
 
 ## Data files and performance
 

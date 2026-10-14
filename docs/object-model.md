@@ -33,8 +33,28 @@ Each persistent database has a schema in its manifest. Schemas specify
 `properties`, each property's type, and a `required` property-name list.
 Supported types are `string`, `integer`, `number`, `boolean`, `null`, `object`,
 and `array`; nested object schemas have their own `properties` and `required`,
-and arrays have an `items` schema. Undeclared fields are rejected. A schema
-change is accepted only if all existing objects pass the new schema.
+and arrays have an `items` schema. Undeclared fields are rejected.
+
+`null` is the explicit "unset" value and satisfies every declared type, so a
+property that must be present (`required`) can still hold it before it has a
+meaningful value: `required` means "the key is present", not "the value is
+non-null". A property may also declare a `default`; the default must itself be a
+valid instance of that property's schema.
+
+Changing a schema **adapts** every existing object to the new schema instead of
+rejecting the change. Adaptation is total, so it always produces a conforming
+object: a missing property is filled from its `default` (or `null` when it has
+none), a property the schema no longer declares is removed, and a value that can
+no longer satisfy its rule is replaced with the rule's default (or `null`). This
+means a schema change can discard data that the new schema no longer allows; the
+`default` values let a caller preserve a meaningful value for newly added fields.
+
+Because a large database can take a while to adapt, the change is applied in the
+background: `PUT /databases/{name}/schema` installs the new schema immediately,
+adapts objects in bounded chunks, and keeps serving other requests while the
+migration runs. The manifest records that a migration is pending, so an
+interrupted run is completed the next time the database is opened. See the HTTP
+API documentation for the response and status fields.
 
 The object's `"id"` field above is ordinary application data. It is not the
 database ID. If this object is created when the database next ID is `0`, the

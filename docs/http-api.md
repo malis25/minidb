@@ -138,18 +138,40 @@ identical whether or not a field is indexed; indexing only changes performance.
 
 ### `GET /databases/{name}/schema` and `PUT /databases/{name}/schema`
 
-GET returns the persisted schema and segment object-count limit. PUT replaces
-the schema only when every existing object satisfies it; otherwise it returns
-HTTP 409 and keeps the previous schema. New and replacement objects are
-validated against the current schema before any data is written.
+GET returns the persisted schema, the segment object-count limit, and the
+current schema-migration status. PUT replaces the schema and **adapts** existing
+objects to it. The body is the new schema; a property may declare a `default`
+that must be a valid instance of that property's schema. When an object lacks a
+property, adaptation fills it from the property's `default`, or with `null` when
+no default is given. A property the new schema no longer declares is removed,
+and a value that can no longer satisfy its rule is replaced with the default (or
+`null`). This is how new fields are backfilled and how data the new schema
+disallows is dropped.
+
+Because adapting a large database can take a while, PUT installs the schema
+immediately and completes the work in the background, so the database keeps
+serving requests. The response reports the remaining work:
+
+```json
+{"name":"users","schema":{...},"updated":true,
+ "migration":{"pending":true,"total":1000,"processed":128,"remaining":872}}
+```
+
+The status is HTTP 200 when the migration finished within the request and HTTP
+202 when it is still running (`migration.pending` is `true`). A second PUT while
+a migration is pending returns HTTP 409. An invalid schema, or a `default` that
+does not match its property, returns HTTP 400 and keeps the previous schema. New
+and replacement objects are validated against the current schema before any data
+is written.
 
 ### `GET /databases/{name}/info`
 
 Returns the active database name, live object count, next ID, whether the
-database is disk-backed, and its indexed fields:
+database is disk-backed, its indexed fields, and its schema-migration status:
 
 ```json
-{"name":"users","object_count":3,"next_id":4,"disk_backed":false,"indexed_fields":[]}
+{"name":"users","object_count":3,"next_id":4,"disk_backed":false,"indexed_fields":[],
+ "migration":{"pending":false,"total":0,"processed":0,"remaining":0}}
 ```
 
 Unknown database names return HTTP 404.

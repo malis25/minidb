@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -14,10 +15,40 @@ class DatabaseDirectoryLock;
 
 struct ManagedDatabase {
     explicit ManagedDatabase(std::unique_ptr<minidb::ObjectStorage> storage);
+    ~ManagedDatabase();
+
+    ManagedDatabase(const ManagedDatabase&) = delete;
+    ManagedDatabase& operator=(const ManagedDatabase&) = delete;
+
+    // Adapts existing objects to a newly installed schema in the background.
+    // The worker holds `mutex` only for one bounded chunk at a time, so other
+    // requests keep making progress while a large database migrates. The caller
+    // must hold `mutex`; starting is only meaningfully possible while no other
+    // migration is pending.
+    void start_schema_migration();
+
+    // Signals the worker to stop. The caller must hold `mutex`; the worker
+    // observes the flag at its next checkpoint and never touches storage again.
+    void signal_schema_migration_stop();
+
+    // Waits for the worker to exit. The caller must NOT hold `mutex`.
+    void join_schema_migration();
+
+    // Convenience for destruction: signal and join without requiring the caller
+    // to manage the locks.
+    void stop_schema_migration();
 
     std::mutex mutex;
     bool active = true;
     minidb::Database database;
+
+  private:
+    void run_schema_migration();
+
+    // `migration_thread_` is only touched under `mutex` or after the database is
+    // inaccessible, so start/signal/join are serialized without their own lock.
+    std::thread migration_thread_;
+    bool migration_stop_ = false;
 };
 
 class DatabaseCatalog {

@@ -86,7 +86,8 @@ database. The core class itself is not internally synchronized.
 `<name>.segment-NNNNNNNN.minidb` data files. Archived databases move to
 `<root>/.archive/<name>/` and are not opened until restored. The manifest
 contains the schema, maximum newly-created objects per segment, segment list,
-and next ID. Data files are append-only; each record stores an operation,
+next ID, and a schema-migration-pending marker that lets an interrupted schema
+change finish when the database is next opened. Data files are append-only; each record stores an operation,
 numeric ID, and (for stores) a JSON object. A batch is one log record
 containing all of its operations, so recovery applies the whole batch or
 truncates an incomplete trailing batch. A dual-slot segment header stores the

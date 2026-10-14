@@ -29,6 +29,9 @@ struct StorageSnapshot {
     std::uint64_t maximum_objects_per_segment = 0;
     std::vector<std::string> indexed_fields;
     bool disk_backed = false;
+    // Set when a schema migration was interrupted (for example by a crash) and
+    // still has objects to adapt; the database completes it while opening.
+    bool schema_migration_pending = false;
 };
 
 enum class StorageMutationType { store, erase };
@@ -52,6 +55,13 @@ class ObjectStorage {
     virtual void apply_batch(const std::vector<StorageMutation>& mutations,
                              std::uint64_t next_id) = 0;
     virtual void update_schema(const ObjectSchema& schema) = 0;
+
+    // Records whether the database still has objects to adapt to the current
+    // schema, so an interrupted migration is completed on the next open. Purely
+    // in-memory backends have nothing to persist and can ignore this.
+    virtual void set_schema_migration_pending(bool pending) {
+        static_cast<void>(pending);
+    }
 
     // Releases any on-disk resources the backend holds open (for example index
     // files). Callers must do this before moving or deleting the database
@@ -124,6 +134,7 @@ class SegmentedStorage final : public ObjectStorage {
     void erase(std::uint64_t id) override;
     void apply_batch(const std::vector<StorageMutation>& mutations, std::uint64_t next_id) override;
     void update_schema(const ObjectSchema& schema) override;
+    void set_schema_migration_pending(bool pending) override;
     void close() override;
 
     [[nodiscard]] bool is_disk_backed() const noexcept override;
@@ -184,6 +195,9 @@ class SegmentedStorage final : public ObjectStorage {
     std::uint64_t manifest_writes_ = 0;
     bool loaded_ = false;
     bool closed_ = false;
+    // True while objects still have to be adapted to schema_. Persisted so an
+    // interrupted schema migration is completed on the next open.
+    bool schema_migration_pending_ = false;
     ObjectSchema schema_;
     std::vector<std::string> segment_files_;
     std::vector<std::uint64_t> segment_object_counts_;

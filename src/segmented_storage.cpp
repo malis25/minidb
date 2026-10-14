@@ -583,6 +583,13 @@ StorageSnapshot SegmentedStorage::load() {
             throw std::runtime_error("Database manifest contains an invalid schema: " +
                                      schema_error);
         }
+        if (manifest.contains("schema_migration_pending")) {
+            if (!manifest["schema_migration_pending"].is_boolean()) {
+                throw std::runtime_error(
+                    "Database manifest contains an invalid schema migration flag.");
+            }
+            schema_migration_pending_ = manifest["schema_migration_pending"].get<bool>();
+        }
         next_id_ = manifest["next_id"].get<std::uint64_t>();
         // A manifest written by a run that reserved ID blocks may record a higher
         // bound than the last used ID. Honour the larger value so reserved IDs are
@@ -901,6 +908,7 @@ StorageSnapshot SegmentedStorage::load() {
     snapshot.maximum_objects_per_segment = maximum_objects_per_segment_;
     snapshot.indexed_fields = indexed_fields_;
     snapshot.disk_backed = disk_backed_;
+    snapshot.schema_migration_pending = schema_migration_pending_;
     if (disk_backed_) {
         snapshot.object_ids.reserve(object_locations_.size());
         for (const auto& [id, location] : object_locations_) {
@@ -1164,6 +1172,7 @@ void SegmentedStorage::save_manifest() {
         {"segments", segment_files_},
         {"indexed_fields", indexed_fields_},
         {"cache_bytes", cache_bytes_},
+        {"schema_migration_pending", schema_migration_pending_},
     };
     auto temporary_path = manifest_path_;
     temporary_path += ".tmp";
@@ -1203,6 +1212,20 @@ void SegmentedStorage::update_schema(const ObjectSchema& schema) {
         save_manifest();
     } catch (...) {
         schema_ = previous_schema;
+        throw;
+    }
+}
+
+void SegmentedStorage::set_schema_migration_pending(bool pending) {
+    if (schema_migration_pending_ == pending) {
+        return;
+    }
+    const auto previous = schema_migration_pending_;
+    schema_migration_pending_ = pending;
+    try {
+        save_manifest();
+    } catch (...) {
+        schema_migration_pending_ = previous;
         throw;
     }
 }

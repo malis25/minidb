@@ -58,7 +58,32 @@ class Database {
     // Apply a set of creates/replacements/deletes as one persistent operation.
     [[nodiscard]] std::vector<std::uint64_t>
     apply_batch(const std::vector<ObjectMutation>& mutations);
+
+    // Replaces the schema only when every existing object already satisfies it;
+    // otherwise it throws std::invalid_argument. Use begin_schema_migration() to
+    // change the schema for existing objects instead of rejecting the change.
     void update_schema(ObjectSchema schema);
+
+    // Replaces the schema and marks every existing object for adaptation to it.
+    // New writes are validated against the new schema immediately, while
+    // existing objects are adapted in bounded chunks by migrate_schema_chunk()
+    // so the database stays responsive. `schema` must be a valid strict schema
+    // whose `default` values are valid instances of their properties.
+    void begin_schema_migration(ObjectSchema schema);
+
+    // Adapts at most `limit` not-yet-adapted objects and persists the changes as
+    // one batch. Returns the number of objects still awaiting adaptation (zero
+    // when the migration is complete). Callers hold the database lock and call
+    // this repeatedly, releasing the lock between calls, until it returns zero.
+    [[nodiscard]] std::size_t migrate_schema_chunk(std::size_t limit);
+
+    struct SchemaMigrationStatus {
+        bool pending = false;
+        std::size_t total = 0;
+        std::size_t processed = 0;
+    };
+    [[nodiscard]] SchemaMigrationStatus schema_migration_status() const noexcept;
+
     [[nodiscard]] const ObjectSchema& schema() const noexcept;
     [[nodiscard]] std::uint64_t maximum_objects_per_segment() const noexcept;
 
@@ -114,6 +139,15 @@ class Database {
         {"type", "object"}, {"properties", Object::object()}, {"additionalProperties", true}};
     std::uint64_t maximum_objects_per_segment_ = 0;
     std::uint64_t next_id_ = 0;
+
+    // Schema-migration bookkeeping. The cursor walks ids in ascending order up
+    // to the highest id that existed when the migration began, so objects
+    // created afterwards (which already satisfy the new schema) are skipped.
+    std::optional<std::uint64_t> migration_cursor_;
+    std::uint64_t migration_limit_id_ = 0;
+    std::size_t migration_total_ = 0;
+    std::size_t migration_processed_ = 0;
+    bool migration_pending_ = false;
 };
 
 } // namespace minidb

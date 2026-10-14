@@ -784,3 +784,140 @@ TEST(SegmentedStorageTests, KeepsIdsContiguousAcrossAGracefulRestart) {
     EXPECT_EQ(restored.create({{"name", "Alan"}}), 2);
 }
 
+TEST(SchemaMigrationTests, AdaptsValuesToSchemaWithDefaultsAndNull) {
+    const minidb::ObjectSchema schema = {
+        {"type", "object"},
+        {"properties",
+         {{"name", {{"type", "string"}}},
+          {"nickname", {{"type", "string"}, {"default", "ada"}}},
+          {"profile",
+           {{"type", "object"},
+            {"properties", {{"city", {{"type", "string"}, {"default", "London"}}}}}}},
+          {"friends", {{"type", "array"}, {"items", {{"type", "integer"}}}}}}},
+        {"required", nlohmann::json::array()}};
+    minidb::Object value = {
+        {"name", "Ada"}, {"legacy", true}, {"profile", minidb::Object::object()}};
+
+    ASSERT_TRUE(minidb::adapt_value_to_schema(value, schema));
+    EXPECT_EQ(value.at("name"), "Ada");
+    EXPECT_EQ(value.at("nickname"), "ada"); // property default
+    EXPECT_EQ(value.at("profile").at("city"), "London"); // nested, recursive
+    ASSERT_TRUE(value.contains("friends"));
+    EXPECT_TRUE(value.at("friends").is_null()); // no default: null
+    EXPECT_FALSE(value.contains("legacy"));     // undeclared: removed
+
+    std::string error;
+    EXPECT_TRUE(minidb::validate_object_against_schema(value, schema, &error)) << error;
+}
+
+TEST(SchemaMigrationTests, AcceptsNullForDeclaredTypesButRejectsInvalidDefaults) {
+    const minidb::ObjectSchema schema = {
+        {"type", "object"},
+        {"properties", {{"age", {{"type", "integer"}}}}},
+        {"required", nlohmann::json::array({"age"})}};
+    std::string error;
+    // A required field may still be present with the explicit "unset" value.
+    EXPECT_TRUE(minidb::validate_object_against_schema({{"age", nullptr}}, schema, &error)) << error;
+    EXPECT_FALSE(minidb::validate_object_against_schema({{"age", "old"}}, schema, &error));
+
+    const minidb::ObjectSchema invalid_default = {
+        {"type", "object"},
+        {"properties", {{"age", {{"type", "integer"}, {"default", "old"}}}}},
+        {"required", nlohmann::json::array()}};
+    EXPECT_FALSE(minidb::validate_schema_defaults(invalid_default, &error));
+}
+
+TEST(SchemaMigrationTests, AdaptsExistingObjectsInResumableChunks) {
+    minidb::Database database;
+    for (int index = 0; index < 5; ++index) {
+        EXPECT_EQ(database.create({{"name", "user" + std::to_string(index)}}),
+                  static_cast<std::uint64_t>(index));
+    }
+    const minidb::ObjectSchema schema = {
+        {"type", "object"},
+        {"properties",
+         {{"name", {{"type", "string"}}}, {"active", {{"type", "boolean"}, {"default", true}}}}},
+        {"required", nlohmann::json::array()}};
+
+    database.begin_schema_migration(schema);
+    const auto started = database.schema_migration_status();
+    EXPECT_TRUE(started.pending);
+    EXPECT_EQ(started.total, 5);
+    // A second change must wait for the first to finish.
+    EXPECT_THROW(database.begin_schema_migration(schema), std::logic_error);
+
+    EXPECT_GT(database.migrate_schema_chunk(2), 0u);
+    EXPECT_TRUE(database.schema_migration_status().pending);
+    while (database.schema_migration_status().pending) {
+        static_cast<void>(database.migrate_schema_chunk(2));
+    }
+    for (const auto id : database.ids()) {
+        const auto object = database.get(id);
+        ASSERT_TRUE(object);
+        EXPECT_EQ(object->at("active"), true);
+        EXPECT_TRUE(object->contains("name"));
+    }
+}
+
+TEST(SchemaMigrationTests, CompletesAnInterruptedMigrationOnReopen) {
+    TemporaryDirectory directory;
+    const minidb::ObjectSchema schema = {
+        {"type", "object"},
+        {"properties",
+         {{"name", {{"type", "string"}}}, {"active", {{"type", "boolean"}, {"default", true}}}}},
+        {"required", nlohmann::json::array()}};
+    {
+        // Simulate a crash: the new schema and the pending flag are persisted,
+        // but the existing object was never adapted.
+        minidb::SegmentedStorage storage(directory.path(), "users", small_segment_size);
+        static_cast<void>(storage.load());
+        storage.store(0, {{"name", "Ada"}}, 1);
+        storage.set_schema_migration_pending(true);
+        storage.update_schema(schema);
+        storage.close();
+    }
+
+    minidb::Database restored{
+        std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", small_segment_size)};
+    const auto object = restored.get(0);
+    ASSERT_TRUE(object);
+    EXPECT_EQ(object->at("name"), "Ada");
+    EXPECT_EQ(object->at("active"), true);
+    EXPECT_FALSE(restored.schema_migration_status().pending);
+
+    // The completed state is durable: reopening finds nothing left to adapt.
+    minidb::Database reopened{
+        std::make_unique<minidb::SegmentedStorage>(directory.path(), "users", small_segment_size)};
+    EXPECT_FALSE(reopened.schema_migration_status().pending);
+    EXPECT_EQ(reopened.get(0)->at("active"), true);
+}
+
+TEST(SchemaMigrationTests, MigratesDiskBackedObjectsAndKeepsIndexesUsable) {
+    TemporaryDirectory directory;
+    const minidb::ObjectSchema migrated = {
+        {"type", "object"},
+        {"properties",
+         {{"name", {{"type", "string"}}}, {"active", {{"type", "boolean"}, {"default", true}}}}},
+        {"required", nlohmann::json::array()}};
+    {
+        minidb::Database database{make_disk_storage(directory.path(), {"name"}, 0)};
+        ASSERT_TRUE(database.disk_backed());
+        EXPECT_EQ(database.create({{"name", "Ada"}}), 0);
+        EXPECT_EQ(database.create({{"name", "Grace"}}), 1);
+
+        database.begin_schema_migration(migrated);
+        while (database.schema_migration_status().pending) {
+            static_cast<void>(database.migrate_schema_chunk(1));
+        }
+        const auto matches = database.find("name", "Ada");
+        ASSERT_EQ(matches.size(), 1u);
+        EXPECT_EQ(matches.front().object->at("active"), true);
+    }
+
+    minidb::Database restored{make_disk_storage(directory.path(), {"name"}, 0)};
+    EXPECT_FALSE(restored.schema_migration_status().pending);
+    EXPECT_EQ(restored.get(0)->at("active"), true);
+    EXPECT_EQ(restored.get(1)->at("active"), true);
+    EXPECT_EQ(restored.find("name", "Grace").size(), 1u);
+}
+

@@ -114,8 +114,8 @@ database-scoped object endpoints directly under `/databases/{name}`. Create a
 database using `POST /databases` with its schema and segment object limit
 before using its object API. `GET /databases/{name}` lists IDs,
 `POST /databases/{name}` creates a schema-validated object,
-`GET|PUT /databases/{name}/schema` reads or updates its schema (only when all
-existing objects pass validation), and `POST /databases/{name}/batch` atomically
+`GET|PUT /databases/{name}/schema` reads or updates its schema (a change adapts
+existing objects in the background), and `POST /databases/{name}/batch` atomically
 applies related changes in that database. IDs are independent per database.
 ID lists and equality queries accept
 `limit` and `offset` query parameters (default page size 100, maximum 1000).
