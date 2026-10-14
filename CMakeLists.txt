@@ -53,6 +53,13 @@ minidb_set_compiler_warnings(minidb_core)
 
 add_subdirectory(src/server)
 
+# The benchmark harness is optional: it links the server module and is not part
+# of the shipped application. MINIDB_BUILD_BENCHMARKS=OFF skips it entirely.
+option(MINIDB_BUILD_BENCHMARKS "Build the MiniDB benchmark harness" ON)
+if(MINIDB_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
 add_executable(minidb
     app/main.cpp
     app/version.cpp

@@ -103,7 +103,9 @@ passes the proposed schema.
 For database name `users`, the directory contains a metadata file
 `data/users/users.manifest.json` and append-only segment files such as
 `data/users/users.segment-00000000.minidb`. The manifest records the schema,
-objects-per-segment limit, segment list, and next ID. A segment header stores
+objects-per-segment limit, segment list, the next ID, and a reserved next-ID
+bound: IDs are persisted in blocks so creating an object does not rewrite the
+manifest every time. A segment header stores
 the number of objects first created in that segment; reaching the configured
 count sends the next newly created object to another segment. Replacements and
 deletions do not consume that object count, so they can still increase the

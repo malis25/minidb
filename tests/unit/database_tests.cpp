@@ -709,3 +709,78 @@ TEST(DiskBackedStorageTests, ReplacesDropStaleIndexEntriesAfterReopen) {
     ASSERT_EQ(reopened->query_index("email", new_value).size(), 1U);
     EXPECT_EQ(reopened->query_index("email", new_value).front(), 0U);
 }
+
+// The manifest is only rewritten when a reserved block of IDs is exhausted, so
+// creating N objects must cause far fewer than N writes.
+TEST(SegmentedStorageTests, BatchesManifestWritesAcrossReservedIdBlocks) {
+    TemporaryDirectory directory;
+    constexpr std::uint64_t reservation = 64;
+    constexpr std::uint64_t object_count = 1000;
+    minidb::SegmentedStorage storage{directory.path(), "users", 100000,
+                                     default_object_schema(), std::vector<std::string>{}, 0, reservation};
+    static_cast<void>(storage.load());
+    const auto baseline = storage.manifest_writes();
+
+    for (std::uint64_t index = 0; index < object_count; ++index) {
+        storage.store(index, {{"name", "object"}}, index + 1);
+    }
+
+    const auto writes = storage.manifest_writes() - baseline;
+    // One write starts the first block, then one more per full block.
+    EXPECT_LE(writes, object_count / reservation + 2);
+    EXPECT_GE(writes, 1U);
+    EXPECT_LT(writes, object_count / 4);
+}
+
+// After an unclean stop the manifest may only record the reservation bound. The
+// backend must resume above that bound instead of reusing reserved IDs.
+TEST(SegmentedStorageTests, HonoursReservedIdsAfterAnUncleanStop) {
+    TemporaryDirectory directory;
+    nlohmann::json crashed_manifest;
+    constexpr std::uint64_t reservation = 8;
+    {
+        minidb::SegmentedStorage storage{directory.path(), "users", 100000,
+                                         default_object_schema(), std::vector<std::string>{}, 0, reservation};
+        static_cast<void>(storage.load());
+        for (std::uint64_t index = 0; index < 3; ++index) {
+            storage.store(index, {{"name", "object"}}, index + 1);
+        }
+        std::ifstream manifest_input(directory.path() / "users.manifest.json");
+        crashed_manifest = nlohmann::json::parse(manifest_input);
+    }
+    // The destructor collapsed the reservation; restore the crash-time view.
+    // The exact next_id lags behind because it is only checkpointed when a block
+    // is reserved, so recovery has to rely on the reservation bound.
+    EXPECT_LT(crashed_manifest["next_id"].get<std::uint64_t>(), 3U);
+    const auto reservation_bound = crashed_manifest["next_id_reservation"].get<std::uint64_t>();
+    EXPECT_GE(reservation_bound, 3U);
+    {
+        std::ofstream manifest_output(directory.path() / "users.manifest.json",
+                                      std::ios::binary | std::ios::trunc);
+        manifest_output << crashed_manifest.dump(2) << '\n';
+    }
+
+    minidb::SegmentedStorage reopened{directory.path(), "users", 100000,
+                                      default_object_schema(), std::vector<std::string>{}, 0, reservation};
+    const auto snapshot = reopened.load();
+    EXPECT_GE(snapshot.next_id, reservation_bound);
+    // Reserved-but-unused IDs are skipped, so an old ID can no longer be stored.
+    EXPECT_THROW(reopened.store(3, {{"name", "reused"}}, 4), std::invalid_argument);
+}
+
+// A graceful restart collapses the reservation, so IDs stay contiguous.
+TEST(SegmentedStorageTests, KeepsIdsContiguousAcrossAGracefulRestart) {
+    TemporaryDirectory directory;
+    {
+        minidb::Database database{std::make_unique<minidb::SegmentedStorage>(
+            directory.path(), "users", 100000, default_object_schema(), std::vector<std::string>{}, 0, 32)};
+        EXPECT_EQ(database.create({{"name", "Ada"}}), 0);
+        EXPECT_EQ(database.create({{"name", "Grace"}}), 1);
+    }
+
+    minidb::Database restored{std::make_unique<minidb::SegmentedStorage>(
+        directory.path(), "users", 100000, default_object_schema(), std::vector<std::string>{}, 0, 32)};
+    EXPECT_EQ(restored.next_id(), 2);
+    EXPECT_EQ(restored.create({{"name", "Alan"}}), 2);
+}
+

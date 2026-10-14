@@ -51,7 +51,10 @@ Create accepts a complete JSON object with no database ID. `Database` uses
 `next_id`, initially zero, and returns that `uint64_t` to the caller. The
 object's own optional `id` field is just data. Updates and deletes address an
 existing database-generated ID; a deleted ID is never reused. The manifest
-persists the next ID, and recovery reconciles it with complete segment records.
+persists the next ID together with a reserved upper bound: IDs are written in
+blocks so creating an object rarely rewrites the manifest. Recovery reconciles
+the checkpoint, the reserved bound, and the complete segment records; a graceful
+close collapses the block so IDs stay contiguous.
 
 ## In-memory indexes
 

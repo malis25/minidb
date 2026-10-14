@@ -75,8 +75,8 @@ into `minidb_core`.
 
 When changing an indexed operation, test index maintenance for create,
 replacement, and delete. When changing storage, test rollover, manifest
-recovery, and interrupted final records. Update the API and storage guides with
-externally visible behavior.
+recovery, ID reservation and reuse after an unclean stop, and interrupted final
+records. Update the API and storage guides with externally visible behavior.
 
 ### C++ example
 

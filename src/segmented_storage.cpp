@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -9,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -174,10 +176,23 @@ bool read_header_slot(std::istream& input, std::uint64_t& generation, std::uint6
 void replace_file(const std::filesystem::path& temporary,
                   const std::filesystem::path& destination) {
 #ifdef _WIN32
-    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
-                                "Could not replace metadata file: " + destination.string());
+    // A virus scanner, search indexer, or backup agent can briefly hold the
+    // destination open, which makes MoveFileExW fail even though the replacement
+    // is valid. Retry those transient sharing errors before giving up.
+    constexpr int maximum_attempts = 50;
+    for (int attempt = 0; attempt < maximum_attempts; ++attempt) {
+        if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return;
+        }
+        const DWORD error = GetLastError();
+        const bool transient = error == ERROR_ACCESS_DENIED ||
+                               error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION;
+        if (!transient || attempt + 1 == maximum_attempts) {
+            throw std::system_error(static_cast<int>(error), std::system_category(),
+                                    "Could not replace metadata file: " + destination.string());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 #else
     std::error_code error;
@@ -213,15 +228,19 @@ bool is_valid_database_name(std::string_view name) noexcept {
 SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string database_name,
                                    std::uint64_t maximum_objects_per_segment, ObjectSchema schema,
                                    std::vector<std::string> indexed_fields,
-                                   std::uint64_t cache_bytes)
+                                   std::uint64_t cache_bytes, std::uint64_t next_id_reservation)
     : directory_(std::move(directory)), database_name_(std::move(database_name)),
-      maximum_objects_per_segment_(maximum_objects_per_segment), schema_(std::move(schema)),
+      maximum_objects_per_segment_(maximum_objects_per_segment),
+      next_id_reservation_size_(next_id_reservation), schema_(std::move(schema)),
       indexed_fields_(std::move(indexed_fields)), cache_bytes_(cache_bytes) {
     if (directory_.empty()) {
         throw std::invalid_argument("Database directory cannot be empty.");
     }
     if (!is_valid_database_name(database_name_)) {
         throw std::invalid_argument("Invalid database name.");
+    }
+    if (next_id_reservation_size_ == 0) {
+        throw std::invalid_argument("The next-ID reservation must be at least one.");
     }
     require_valid_indexed_fields(indexed_fields_);
     if (maximum_objects_per_segment_ == 0) {
@@ -236,12 +255,30 @@ SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string 
     manifest_path_ = directory_ / (database_name_ + ".manifest.json");
 }
 
+SegmentedStorage::~SegmentedStorage() {
+    // Best effort: a graceful shutdown collapses a partially used reservation so
+    // the next open does not skip IDs. Errors are ignored because a destructor
+    // must not throw, and recovery can always rebuild next_id from the segments.
+    try {
+        collapse_next_id_reservation();
+    } catch (...) {
+    }
+}
+
 bool SegmentedStorage::is_disk_backed() const noexcept {
     return disk_backed_;
 }
 
 std::uint64_t SegmentedStorage::cache_bytes() const noexcept {
     return cache_bytes_;
+}
+
+std::uint64_t SegmentedStorage::next_id_reservation() const noexcept {
+    return next_id_reservation_size_;
+}
+
+std::uint64_t SegmentedStorage::manifest_writes() const noexcept {
+    return manifest_writes_;
 }
 
 std::vector<std::string> SegmentedStorage::indexed_fields() const {
@@ -502,6 +539,7 @@ StorageSnapshot SegmentedStorage::load() {
                 "Database manifest is missing while segment files already exist.");
         }
         next_id_ = 0;
+        next_id_reservation_ = 0;
         if (schema_.is_null()) {
             throw std::invalid_argument("New databases require an object schema.");
         }
@@ -546,6 +584,14 @@ StorageSnapshot SegmentedStorage::load() {
                                      schema_error);
         }
         next_id_ = manifest["next_id"].get<std::uint64_t>();
+        // A manifest written by a run that reserved ID blocks may record a higher
+        // bound than the last used ID. Honour the larger value so reserved IDs are
+        // never handed out twice after an unclean stop.
+        if (manifest.contains("next_id_reservation") &&
+            manifest["next_id_reservation"].is_number_unsigned()) {
+            next_id_ =
+                std::max(next_id_, manifest["next_id_reservation"].get<std::uint64_t>());
+        }
         if (manifest.contains("indexed_fields")) {
             if (!manifest["indexed_fields"].is_array()) {
                 throw std::runtime_error("Database manifest contains an invalid index list.");
@@ -842,8 +888,12 @@ StorageSnapshot SegmentedStorage::load() {
 
     if (recovered_next_id != next_id_ || manifest_needs_save) {
         next_id_ = recovered_next_id;
+        next_id_reservation_ = next_id_;
         save_manifest();
+    } else {
+        next_id_reservation_ = next_id_;
     }
+    loaded_ = true;
 
     StorageSnapshot snapshot;
     snapshot.next_id = next_id_;
@@ -1074,11 +1124,20 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
 
     if (update_next_id && next_id != next_id_) {
         const auto previous_next_id = next_id_;
+        const auto previous_reservation = next_id_reservation_;
         next_id_ = next_id;
+        const bool reservation_advanced = next_id_ >= next_id_reservation_;
+        if (reservation_advanced) {
+            next_id_reservation_ = next_id_ + next_id_reservation_size_;
+        }
+        if (!reservation_advanced) {
+            return segment_size;
+        }
         try {
             save_manifest();
         } catch (...) {
             next_id_ = previous_next_id;
+            next_id_reservation_ = previous_reservation;
             std::error_code rollback_error;
             std::filesystem::resize_file(segment_path, segment_size, rollback_error);
             if (rollback_error) {
@@ -1099,6 +1158,7 @@ void SegmentedStorage::save_manifest() {
     const nlohmann::json manifest = {
         {"format", manifest_format},
         {"next_id", next_id_},
+        {"next_id_reservation", next_id_reservation_},
         {"maximum_objects_per_segment", maximum_objects_per_segment_},
         {"schema", schema_},
         {"segments", segment_files_},
@@ -1121,6 +1181,15 @@ void SegmentedStorage::save_manifest() {
                                  temporary_path.string());
     }
     replace_file(temporary_path, manifest_path_);
+    ++manifest_writes_;
+}
+
+void SegmentedStorage::collapse_next_id_reservation() {
+    if (!loaded_ || closed_ || next_id_reservation_ == next_id_) {
+        return;
+    }
+    next_id_reservation_ = next_id_;
+    save_manifest();
 }
 
 void SegmentedStorage::update_schema(const ObjectSchema& schema) {
@@ -1139,6 +1208,14 @@ void SegmentedStorage::update_schema(const ObjectSchema& schema) {
 }
 
 void SegmentedStorage::close() {
+    // Collapse any partially used ID reservation so a clean restart stays
+    // contiguous. Best effort: releasing the files below matters more than the
+    // manifest, which recovery can rebuild by scanning the segments.
+    try {
+        collapse_next_id_reservation();
+    } catch (...) {
+    }
+    closed_ = true;
     // Dropping the trees closes their files. Leaving them open would prevent the
     // database directory from being renamed or removed on Windows.
     index_trees_.clear();

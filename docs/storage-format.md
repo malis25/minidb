@@ -55,6 +55,7 @@ replaced. Its logical shape is:
   "indexed_fields": ["username"],
   "cache_bytes": 67108864,
   "next_id": 5,
+  "next_id_reservation": 128,
   "segments": [
     "users.segment-00000000.minidb",
     "users.segment-00000001.minidb"
@@ -62,9 +63,18 @@ replaced. Its logical shape is:
 }
 ```
 
-`next_id` is the ID to allocate for the next created object. The schema is
-enforced for all new and replaced objects. The positive object-count limit is
-chosen when creating the database and is thereafter stored in metadata.
+`next_id` is the ID to allocate for the next created object. Because IDs are
+reserved in blocks rather than persisted on every store, `next_id` is a
+checkpoint: it can lag the true next ID until a block is refreshed or the
+database is closed. `next_id_reservation` is the exclusive upper bound of IDs
+that have already been promised by a manifest write. On reopen the effective
+next ID is the larger of the two, so a reserved ID is never handed out twice
+even after an unclean stop. The reservation block size is a construction-time
+policy (`default_next_id_reservation`, 128) and is not required to match the
+stored value.
+The schema is enforced for all new and replaced objects. The positive
+object-count limit is chosen when creating the database and is thereafter stored
+in metadata.
 
 `indexed_fields` lists the fields that have an on-disk B+ tree index.
 `cache_bytes` is the byte budget for the per-database in-memory object cache.
@@ -110,9 +120,9 @@ malformed record causes startup to fail. An incomplete record at the end of
 the final segment is truncated to the start of that record; an incomplete
 record in an earlier segment is an error. The segment object count is reconciled
 while records are already being replayed. A missing manifest-listed segment is
-an error unless it is the sole initial segment and the manifest still has
-`next_id` zero; only that provably empty initialization state can be safely
-recreated.
+an error unless it is the sole initial segment and the reconciled next ID is
+still zero (both `next_id` and `next_id_reservation` are zero); only that
+provably empty initialization state can be safely recreated.
 
 When a new segment is needed, the empty file is created before the manifest is
 updated, and the record is appended only after both steps succeed. If a crash
@@ -125,6 +135,15 @@ If the process stops after appending a complete new-object record but before
 persisting the advanced `next_id`, recovery finds that ID while scanning and
 advances the counter. If the process stops before a complete append, incomplete
 bytes are removed and the ID may safely be used on the next create.
+
+IDs are reserved in blocks so the manifest does not have to be rewritten on
+every create. When the in-memory next ID would cross `next_id_reservation`, the
+bound is extended by the reservation block size and the manifest is rewritten
+once. After an unclean stop, recovery resumes at the larger of the checkpoint,
+the reserved bound, and one past the highest ID found while scanning, so IDs in
+the unused tail of a block are skipped rather than reused. A graceful close
+collapses the reservation back onto the exact next ID, so a clean restart does
+not skip IDs.
 
 ## Disk-backed indexes and object cache
 
@@ -156,7 +175,9 @@ writes and erases update or evict the affected entry.
 ## Limits and unsupported formats
 
 Manifest format 4 defines the schema, object-count limit, `MINIDB3` headers, the
-indexed field list, and the cache budget. There is no migration or backward
+indexed field list, the cache budget, and the reserved next-ID bound
+(`next_id_reservation`, optional for compatibility with manifests written before
+it existed). There is no migration or backward
 compatibility: any other manifest format and any segment without the `MINIDB3`
 signature are rejected on startup rather than converted.
 

@@ -90,6 +90,19 @@ class ObjectStorage {
     }
 };
 
+// IDs are reserved in blocks so that creating objects does not rewrite the
+// manifest on every store. The manifest only needs to guarantee that an ID is
+// never handed out twice, so it records an upper bound and the backend skips the
+// unused remainder of a block after an unclean stop. A graceful close collapses
+// the block back to the exact next ID, so clean restarts keep IDs contiguous.
+//
+// The value is the start of the measured throughput plateau: a write sweep
+// (benchmarks/reservation_benchmark_main.cpp) shows Debug/Release throughput
+// reaching ~98% of its asymptote by 128, with no meaningful gain beyond it. A
+// smaller block writes the manifest more often; a larger one wastes more IDs
+// after an unclean stop, so 128 balances the two.
+inline constexpr std::uint64_t default_next_id_reservation = 128;
+
 // The current backend stores metadata in one manifest and records in segments
 // bounded by the number of newly created objects. Other backends can implement
 // ObjectStorage later.
@@ -101,7 +114,10 @@ class SegmentedStorage final : public ObjectStorage {
                                             {"properties", Object::object()},
                                             {"additionalProperties", true}},
                      std::vector<std::string> indexed_fields = {},
-                     std::uint64_t cache_bytes = 0);
+                     std::uint64_t cache_bytes = 0,
+                     std::uint64_t next_id_reservation = default_next_id_reservation);
+
+    ~SegmentedStorage() override;
 
     [[nodiscard]] StorageSnapshot load() override;
     void store(std::uint64_t id, const Object& object, std::uint64_t next_id) override;
@@ -121,6 +137,10 @@ class SegmentedStorage final : public ObjectStorage {
     [[nodiscard]] const std::filesystem::path& manifest_path() const noexcept;
     [[nodiscard]] std::uint64_t maximum_objects_per_segment() const noexcept;
     [[nodiscard]] std::uint64_t cache_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t next_id_reservation() const noexcept;
+    // Number of manifest writes performed so far; useful for tests and for
+    // measuring how often the reservation has to be refreshed.
+    [[nodiscard]] std::uint64_t manifest_writes() const noexcept;
 
   private:
     struct ObjectLocation {
@@ -134,6 +154,9 @@ class SegmentedStorage final : public ObjectStorage {
     std::uint64_t append_payload(std::string record, std::uint64_t next_id, bool update_next_id,
                                  std::uint64_t created_objects);
     void save_manifest();
+    // Writes the manifest with the exact next ID and clears any unused reserved
+    // block. Best-effort on shutdown so clean restarts do not skip IDs.
+    void collapse_next_id_reservation();
     void create_segment(const std::string& filename);
     void update_segment_object_count(const std::filesystem::path& path, std::uint64_t object_count);
 
@@ -154,6 +177,13 @@ class SegmentedStorage final : public ObjectStorage {
     std::string database_name_;
     std::uint64_t maximum_objects_per_segment_;
     std::uint64_t next_id_ = 0;
+    // Exclusive upper bound of IDs that are safe to hand out without another
+    // manifest write. next_id_ <= next_id_reservation_ always holds.
+    std::uint64_t next_id_reservation_size_ = default_next_id_reservation;
+    std::uint64_t next_id_reservation_ = 0;
+    std::uint64_t manifest_writes_ = 0;
+    bool loaded_ = false;
+    bool closed_ = false;
     ObjectSchema schema_;
     std::vector<std::string> segment_files_;
     std::vector<std::uint64_t> segment_object_counts_;
