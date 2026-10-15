@@ -74,7 +74,9 @@ void SegmentedStorage::save_manifest() {
     if (!output) {
         throw std::runtime_error("Could not write database manifest: " + temporary_path.string());
     }
-    output << manifest.dump(2) << '\n';
+    // Compact output halves the manifest size on the reservation=1 path, where
+    // the manifest is rewritten once per stored object.
+    output << manifest.dump() << '\n';
     output.close();
     if (!output) {
         throw std::runtime_error("Could not finish writing database manifest: " +

@@ -149,19 +149,23 @@ inline std::uint64_t read_u64(std::string_view bytes, std::size_t& offset) {
 }
 
 inline void write_u64(std::ostream& output, std::uint64_t value) {
+    // Write the eight little-endian bytes in one call instead of eight put()
+    // calls; stream insertion per byte dominates header and record writes.
+    char bytes[sizeof(std::uint64_t)];
     for (unsigned int shift = 0; shift < 64; shift += 8) {
-        output.put(static_cast<char>((value >> shift) & 0xff));
+        bytes[shift / 8] = static_cast<char>((value >> shift) & 0xff);
     }
+    output.write(bytes, sizeof(bytes));
 }
 
 inline std::uint64_t read_u64(std::istream& input) {
+    char bytes[sizeof(std::uint64_t)];
+    if (!input.read(bytes, sizeof(bytes))) {
+        throw std::runtime_error("Database record length is truncated.");
+    }
     std::uint64_t value = 0;
     for (unsigned int shift = 0; shift < 64; shift += 8) {
-        const auto byte = input.get();
-        if (byte == std::char_traits<char>::eof()) {
-            throw std::runtime_error("Database record length is truncated.");
-        }
-        value |= static_cast<std::uint64_t>(static_cast<unsigned char>(byte)) << shift;
+        value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[shift / 8])) << shift;
     }
     return value;
 }

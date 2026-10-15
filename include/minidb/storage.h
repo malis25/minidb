@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <list>
 #include <memory>
 #include <string>
@@ -170,6 +171,11 @@ class SegmentedStorage final : public ObjectStorage {
     void collapse_next_id_reservation();
     void create_segment(const std::string& filename);
     void update_segment_object_count(const std::filesystem::path& path, std::uint64_t object_count);
+    // Writes the next alternating header slot on an already-open, signature-checked
+    // segment stream. append_payload reuses the stream it just appended to so a
+    // stored record costs one open instead of three.
+    void write_segment_object_count(std::fstream& file, const std::filesystem::path& path,
+                                    std::uint64_t object_count);
 
     void open_index_trees();
     void build_index_tree(const std::string& field);

@@ -92,14 +92,6 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
         throw std::runtime_error("Active database segment has an invalid size: " +
                                  segment_path.string());
     }
-    {
-        std::ifstream input(segment_path, std::ios::binary);
-        std::array<char, detail::segment_signature.size()> signature{};
-        input.read(signature.data(), static_cast<std::streamsize>(signature.size()));
-        if (!input || signature != detail::segment_signature) {
-            throw std::runtime_error("Invalid database segment header: " + segment_path.string());
-        }
-    }
     if (record.size() > std::numeric_limits<std::uint64_t>::max() - detail::record_length_size) {
         throw std::length_error("Database record is too large to write.");
     }
@@ -137,16 +129,29 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
         segment_size = detail::header_size;
     }
 
-    std::ofstream output(segment_path, std::ios::binary | std::ios::app);
-    if (!output) {
+    // One stream serves the signature check, the record append, and the object
+    // count update. Opening the segment once per store instead of three times
+    // removes the dominant cost for small-object workloads.
+    std::fstream file(segment_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file) {
         throw std::runtime_error("Could not open database segment for appending: " +
                                  segment_path.string());
     }
-    detail::write_u64(output, static_cast<std::uint64_t>(record.size()));
-    output.write(record.data(), static_cast<std::streamsize>(record.size()));
-    output.flush();
-    output.close();
-    if (!output) {
+    {
+        std::array<char, detail::segment_signature.size()> signature{};
+        file.read(signature.data(), static_cast<std::streamsize>(signature.size()));
+        if (!file || signature != detail::segment_signature) {
+            throw std::runtime_error("Invalid database segment header: " + segment_path.string());
+        }
+    }
+    file.clear();
+    file.seekp(0, std::ios::end);
+    detail::write_u64(file, static_cast<std::uint64_t>(record.size()));
+    file.write(record.data(), static_cast<std::streamsize>(record.size()));
+    // Flush the record before the header slot so a crash cannot leave the object
+    // count ahead of the record it describes.
+    file.flush();
+    if (!file) {
         std::error_code rollback_error;
         std::filesystem::resize_file(segment_path, segment_size, rollback_error);
         if (rollback_error) {
@@ -158,7 +163,7 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
     const auto previous_object_count = segment_object_counts_.back();
     if (created_objects > 0) {
         try {
-            update_segment_object_count(segment_path, previous_object_count + created_objects);
+            write_segment_object_count(file, segment_path, previous_object_count + created_objects);
             segment_object_counts_.back() = previous_object_count + created_objects;
         } catch (...) {
             std::error_code rollback_error;
@@ -170,6 +175,7 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
             throw;
         }
     }
+    file.close();
 
     if (update_next_id && next_id != next_id_) {
         const auto previous_next_id = next_id_;
@@ -248,6 +254,14 @@ void SegmentedStorage::update_segment_object_count(const std::filesystem::path& 
     if (!file || signature != detail::segment_signature) {
         throw std::runtime_error("Invalid database segment header: " + path.string());
     }
+    write_segment_object_count(file, path, object_count);
+}
+
+void SegmentedStorage::write_segment_object_count(std::fstream& file,
+                                                  const std::filesystem::path& path,
+                                                  std::uint64_t object_count) {
+    file.clear();
+    file.seekg(static_cast<std::streamoff>(detail::segment_signature.size()), std::ios::beg);
     std::uint64_t first_generation = 0;
     std::uint64_t first_count = 0;
     const bool first_valid = detail::read_header_slot(file, first_generation, first_count);
