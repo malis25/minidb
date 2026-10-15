@@ -86,9 +86,13 @@ void SegmentedStorage::save_manifest() {
     // Order matters: flush the new manifest's contents before the atomic rename,
     // then flush the directory entry so the rename itself survives a crash. A
     // reader therefore sees either the old or the new manifest, never a torn one.
-    detail::sync_file(temporary_path);
+    if (durable_) {
+        detail::sync_file(temporary_path);
+    }
     replace_file(temporary_path, manifest_path_);
-    detail::sync_directory(directory_);
+    if (durable_) {
+        detail::sync_directory(directory_);
+    }
     ++manifest_writes_;
 }
 

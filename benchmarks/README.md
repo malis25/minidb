@@ -46,7 +46,7 @@ Disable the harness entirely with `-DMINIDB_BUILD_BENCHMARKS=OFF`.
 ## Chart
 
 ```powershell
-python benchmarks/plot_benchmark.py
+python benchmarks/plots/plot_benchmark.py
 ```
 
 Reads `benchmarks/results/benchmark.json` and writes
@@ -75,7 +75,7 @@ cmake --build build --config Debug --target minidb_write_bench
 cmake --build build --config Release --target minidb_write_bench
 .\build\benchmarks\Debug\minidb_write_bench.exe --out benchmarks/results/reservation-sweep.json
 .\build\benchmarks\Release\minidb_write_bench.exe --objects 8000 --out benchmarks/results/reservation-sweep-release.json
-python benchmarks/plot_reservation_sweep.py
+python benchmarks/plots/plot_reservation_sweep.py
 ```
 
 | Flag | Default | Meaning |
@@ -83,7 +83,14 @@ python benchmarks/plot_reservation_sweep.py
 | `--objects N` | 4000 | Objects stored per measured run |
 | `--repeats R` | 3 | Runs per size; the fastest is reported |
 | `--sizes a,b,c` | geometric 1…4096 | Reservation block sizes to test |
+| `--durable true\|false` | true | Force every write to stable storage (fsync) or skip it |
 | `--out PATH` | `benchmarks/results/reservation-sweep.json` | JSON output path |
+
+The `--durable` flag toggles the per-record durability barrier. Running the sweep
+once with `--durable false` and once with `--durable true` measures the
+throughput cost of durability; the JSON output records the mode it used.
+`benchmarks/plots/durability_tradeoff.py` charts that comparison, and
+`benchmarks/plots/final_state_overview.py` summarises the final storage state.
 
 The plot script reads the Debug and Release JSON files and writes
 `benchmarks/results/reservation-sweep.png` (throughput and manifest writes versus
@@ -105,7 +112,7 @@ cmake --build build --config Debug --target minidb_concurrency_bench
 .\build\benchmarks\Debug\minidb_concurrency_bench.exe `
     --objects 1000 --seconds 2 --peak-seconds 8 --levels 1,2,4,8,16,32,64,128 `
     --keep-alive --worker-pool 128 --out benchmarks/results/concurrency-1.json
-python benchmarks/plot_concurrency.py
+python benchmarks/plots/plot_concurrency.py
 ```
 
 | Flag | Default | Meaning |

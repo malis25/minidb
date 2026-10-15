@@ -37,7 +37,7 @@ TEST(SegmentedStorageTests, RejectsLegacyManifestAndSegmentFormats) {
     {
         std::ifstream input(manifest_path);
         auto manifest = nlohmann::json::parse(input);
-        manifest["format"] = "MINIDB-MANIFEST-4";
+        manifest["format"] = "MINIDB-MANIFEST-5";
         std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
         output << manifest.dump(2) << '\n';
     }
@@ -116,7 +116,7 @@ TEST(SegmentedStorageTests, RecoversAnEmptySegmentCreatedBeforeManifestCommit) {
                 orphan.put(static_cast<char>((value >> shift) & 0xff));
             }
         };
-        orphan.write("MINIDB3\0", 8);
+        orphan.write("MINIDB4\0", 8);
         write_u64(0);
         write_u64(0);
         write_u64(0x4d494e4944423300ULL);

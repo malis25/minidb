@@ -21,8 +21,8 @@
 // in separate files without duplicating layout constants or byte-level encoding.
 namespace minidb::detail {
 
-inline constexpr std::array<char, 8> segment_signature{'M', 'I', 'N', 'I', 'D', 'B', '3', '\0'};
-inline constexpr std::string_view manifest_format = "MINIDB-MANIFEST-4";
+inline constexpr std::array<char, 8> segment_signature{'M', 'I', 'N', 'I', 'D', 'B', '4', '\0'};
+inline constexpr std::string_view manifest_format = "MINIDB-MANIFEST-5";
 inline constexpr char store_operation = 'S';
 inline constexpr char erase_operation = 'E';
 inline constexpr char batch_operation = 'T';
@@ -31,7 +31,11 @@ inline constexpr std::uint64_t header_size = segment_signature.size() + 2 * head
 inline constexpr std::uint64_t header_checksum_salt = 0x4d494e4944423300ULL;
 inline constexpr std::uint64_t default_objects_per_segment = 10000;
 inline constexpr std::uint64_t record_length_size = sizeof(std::uint64_t);
+// A single-record operation is at least an operation byte plus an ID.
 inline constexpr std::uint64_t record_prefix_size = 1 + sizeof(std::uint64_t);
+// Every record ends with a checksum over its body so an in-place bit flip in an
+// otherwise well-formed record is detected instead of silently decoded.
+inline constexpr std::uint64_t record_checksum_size = sizeof(std::uint64_t);
 
 // Each segment header holds two checksummed slots written in alternation. The
 // checksum lets recovery pick the newer intact slot after a torn write.
@@ -146,6 +150,32 @@ inline std::uint64_t read_u64(std::string_view bytes, std::size_t& offset) {
     std::uint64_t value = 0;
     for (unsigned int shift = 0; shift < 64; shift += 8) {
         value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[offset++])) << shift;
+    }
+    return value;
+}
+
+// FNV-1a over a record body. The record checksum detects an in-place bit flip in
+// a record whose length prefix is still intact, which the length check alone
+// cannot catch.
+inline std::uint64_t record_checksum(std::string_view body) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto byte : body) {
+        hash ^= static_cast<unsigned char>(byte);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+inline void append_record_checksum(std::string& record) {
+    append_u64(record, record_checksum(record));
+}
+
+inline std::uint64_t read_record_checksum(std::string_view record) {
+    const auto start = record.size() - record_checksum_size;
+    std::uint64_t value = 0;
+    for (unsigned int shift = 0; shift < 64; shift += 8) {
+        value |= static_cast<std::uint64_t>(static_cast<unsigned char>(record[start + shift / 8]))
+                 << shift;
     }
     return value;
 }

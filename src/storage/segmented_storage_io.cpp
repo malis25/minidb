@@ -52,6 +52,7 @@ void SegmentedStorage::append_record(char operation, std::uint64_t id, const Obj
         detail::append_u64(record, static_cast<std::uint64_t>(json.size()));
         record.append(json);
     }
+    detail::append_record_checksum(record);
     const auto created_objects =
         object != nullptr && id == next_id_ && next_id > next_id_ ? 1U : 0U;
     const auto record_start = append_payload(std::move(record), next_id, true, created_objects);
@@ -171,7 +172,9 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
     // Durability barrier: the record (and its counted header slot) must reach
     // stable storage before the next-ID reservation manifest is allowed to
     // advance, so recovery can never observe a reservation ahead of its data.
-    detail::sync_file(segment_path);
+    if (durable_) {
+        detail::sync_file(segment_path);
+    }
 
     if (update_next_id && next_id != next_id_) {
         const auto previous_next_id = next_id_;
@@ -239,7 +242,9 @@ void SegmentedStorage::create_segment(const std::string& filename) {
     }
     // The new segment must exist on disk before the manifest lists it; otherwise
     // a crash could leave a manifest that references a missing segment.
-    detail::sync_file(segment_path);
+    if (durable_) {
+        detail::sync_file(segment_path);
+    }
 }
 
 void SegmentedStorage::update_segment_object_count(const std::filesystem::path& path,

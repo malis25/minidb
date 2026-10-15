@@ -43,7 +43,7 @@ replaced. Its logical shape is:
 
 ```json
 {
-  "format": "MINIDB-MANIFEST-4",
+  "format": "MINIDB-MANIFEST-5",
   "maximum_objects_per_segment": 10000,
   "schema": {
     "type": "object",
@@ -87,19 +87,21 @@ as `false`.
 
 `indexed_fields` lists the fields that have an on-disk B+ tree index.
 `cache_bytes` is the byte budget for the per-database in-memory object cache.
-When both are empty/zero the database operates exactly like format 3: every
+When both are empty/zero the database operates exactly like the original
+all-in-memory mode: every
 live object is held in memory. The manifest is authoritative on reopen, so a
 database reopens in the same storage mode it was last saved with.
 
 ## Segment records
 
-Every current segment begins with the eight-byte signature `MINIDB3` followed
+Every current segment begins with the eight-byte signature `MINIDB4` followed
 by a zero byte. The remaining 48-byte header contains two counter slots; each
 slot stores a generation, the number of IDs first created in this segment, and
 a checksum. The newest valid slot is used, so an interrupted header update
 leaves the preceding slot available. Records follow the 56-byte header until
 end-of-file. Each record starts with an unsigned 64-bit little-endian payload
-length.
+length and ends with an unsigned 64-bit little-endian FNV-1a checksum over the
+rest of the record body.
 
 | Payload | Encoding |
 |---|---|
@@ -107,6 +109,7 @@ length.
 | Object ID | Unsigned 64-bit little-endian database ID |
 | Object byte length | Unsigned 64-bit little-endian length; `S` records only |
 | Object | UTF-8 JSON object bytes; `S` records only |
+| Checksum | Unsigned 64-bit little-endian FNV-1a over all preceding bytes |
 
 A `T` record uses a reserved zero object ID, followed by an unsigned 64-bit
 operation count. The payload then contains that many inline operations: `S`,
@@ -124,8 +127,10 @@ created ID and remain a single atomic record.
 ## Recovery and validation
 
 Startup validates the manifest, segment sequence, signatures, header slots,
-record sizes, operations, IDs, JSON objects, and schema conformance. A complete
-malformed record causes startup to fail. An incomplete record at the end of
+record sizes, record checksums, operations, IDs, JSON objects, and schema
+conformance. A complete malformed record — including one whose checksum does not
+match, which detects an in-place bit flip that leaves the length intact — causes
+startup to fail rather than drop the record. An incomplete record at the end of
 the final segment is truncated to the start of that record; an incomplete
 record in an earlier segment is an error. The segment object count is reconciled
 while records are already being replayed. A missing manifest-listed segment is
@@ -183,11 +188,11 @@ writes and erases update or evict the affected entry.
 
 ## Limits and unsupported formats
 
-Manifest format 4 defines the schema, object-count limit, `MINIDB3` headers, the
+Manifest format 5 defines the schema, object-count limit, `MINIDB4` headers, the
 indexed field list, the cache budget, and the reserved next-ID bound
 (`next_id_reservation`, optional for compatibility with manifests written before
 it existed). There is no migration or backward
-compatibility: any other manifest format and any segment without the `MINIDB3`
+compatibility: any other manifest format and any segment without the `MINIDB4`
 signature are rejected on startup rather than converted.
 
 Segments are append-only and are not compacted. Updates and deletes therefore
@@ -199,6 +204,25 @@ on demand and only the bounded cache, the location map, and the index trees
 reside in memory. Only one process may use a database directory at a time. An
 operating-system lock file prevents concurrent server processes from opening
 the same database root.
+
+## Durability
+
+Each accepted write is forced to stable storage before success is reported.
+By default (`durable = true`) the storage opens the segment after flushing its
+stream and calls the platform durability primitive (`FlushFileBuffers` on
+Windows, `fsync` elsewhere), so the record cannot be lost by a power loss or
+kernel panic. Ordering is enforced so recovery can never observe an inconsistent
+state: the record reaches stable storage before the manifest, a new segment
+reaches stable storage before the manifest lists it, and the manifest's
+temporary file is flushed before its atomic rename, after which the containing
+directory is flushed (a no-op on Windows, whose filesystem journals directory
+metadata).
+
+Durability can be disabled at construction (`durable = false`). The on-disk
+format and write ordering are unchanged; only the fsync calls are skipped, so a
+process crash is still safe and cannot corrupt or lose committed records, but
+the most recent acknowledged writes may be lost if the machine loses power. This
+trades the per-write disk barrier for throughput.
 
 Each record is flushed before success is reported, but this is not a guarantee
 against all power-loss or storage-device failures. The current object API is

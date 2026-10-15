@@ -42,11 +42,13 @@ bool is_valid_database_name(std::string_view name) noexcept {
 SegmentedStorage::SegmentedStorage(std::filesystem::path directory, std::string database_name,
                                    std::uint64_t maximum_objects_per_segment, ObjectSchema schema,
                                    std::vector<std::string> indexed_fields,
-                                   std::uint64_t cache_bytes, std::uint64_t next_id_reservation)
+                                   std::uint64_t cache_bytes, std::uint64_t next_id_reservation,
+                                   bool durable)
     : directory_(std::move(directory)), database_name_(std::move(database_name)),
       maximum_objects_per_segment_(maximum_objects_per_segment),
-      next_id_reservation_size_(next_id_reservation), schema_(std::move(schema)),
-      indexed_fields_(std::move(indexed_fields)), cache_bytes_(cache_bytes) {
+      next_id_reservation_size_(next_id_reservation), durable_(durable),
+      schema_(std::move(schema)), indexed_fields_(std::move(indexed_fields)),
+      cache_bytes_(cache_bytes) {
     if (directory_.empty()) {
         throw std::invalid_argument("Database directory cannot be empty.");
     }
@@ -89,6 +91,10 @@ std::uint64_t SegmentedStorage::cache_bytes() const noexcept {
 
 std::uint64_t SegmentedStorage::next_id_reservation() const noexcept {
     return next_id_reservation_size_;
+}
+
+bool SegmentedStorage::durable() const noexcept {
+    return durable_;
 }
 
 std::uint64_t SegmentedStorage::manifest_writes() const noexcept {
@@ -323,7 +329,7 @@ StorageSnapshot SegmentedStorage::load() {
                 std::filesystem::resize_file(segment_path, record_start);
                 break;
             }
-            if (record_size < detail::record_prefix_size ||
+            if (record_size < detail::record_prefix_size + detail::record_checksum_size ||
                 record_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
                 record_size >
                     static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
@@ -337,6 +343,16 @@ StorageSnapshot SegmentedStorage::load() {
             }
             valid_size += record_size;
 
+            // The checksum guards against an in-place bit flip in a record whose
+            // length prefix is still intact. A mismatch is unrecoverable, so it is
+            // reported instead of silently dropping the record.
+            const auto body_size = record.size() - detail::record_checksum_size;
+            if (detail::read_record_checksum(record) !=
+                detail::record_checksum(std::string_view{record}.substr(0, body_size))) {
+                throw std::runtime_error("Database segment record checksum mismatch: " +
+                                         segment_path.string());
+            }
+
             const auto operation = record.front();
             std::size_t offset = 1;
             const auto id = detail::read_u64(record, offset);
@@ -347,12 +363,13 @@ StorageSnapshot SegmentedStorage::load() {
             }
             if (operation == detail::store_operation) {
                 const auto object_size = detail::read_u64(record, offset);
-                if (object_size != record.size() - offset) {
+                if (object_size != body_size - offset) {
                     throw std::runtime_error("Database object record has an invalid payload size.");
                 }
                 const auto payload_offset = record_start + detail::record_length_size + offset;
-                auto object = detail::parse_stored_object(std::string_view{record}.substr(offset),
-                                                          segment_path);
+                auto object = detail::parse_stored_object(
+                    std::string_view{record}.substr(offset, static_cast<std::size_t>(object_size)),
+                    segment_path);
                 if (stored_ids.insert(id).second) {
                     ++recovered_object_count;
                 }
@@ -365,7 +382,7 @@ StorageSnapshot SegmentedStorage::load() {
                     objects.insert_or_assign(id, std::move(object));
                 }
             } else if (operation == detail::erase_operation) {
-                if (offset != record.size()) {
+                if (offset != body_size) {
                     throw std::runtime_error("Database deletion record contains trailing data.");
                 }
                 if (disk_backed_) {
@@ -377,9 +394,8 @@ StorageSnapshot SegmentedStorage::load() {
             } else if (operation == detail::batch_operation) {
                 const auto mutation_count = detail::read_u64(record, offset);
                 if (mutation_count == 0 ||
-                    mutation_count >
-                        static_cast<std::uint64_t>(record.size() - offset) /
-                            detail::record_prefix_size) {
+                    mutation_count > static_cast<std::uint64_t>(body_size - offset) /
+                                         detail::record_prefix_size) {
                     throw std::runtime_error(
                         "Database batch record has an invalid operation count.");
                 }
@@ -387,14 +403,14 @@ StorageSnapshot SegmentedStorage::load() {
                 mutations.reserve(static_cast<std::size_t>(mutation_count));
                 for (std::uint64_t mutation_index = 0; mutation_index < mutation_count;
                      ++mutation_index) {
-                    if (offset == record.size()) {
+                    if (offset == body_size) {
                         throw std::runtime_error("Database batch record is truncated.");
                     }
                     const auto mutation_operation = record[offset++];
                     const auto mutation_id = detail::read_u64(record, offset);
                     if (mutation_operation == detail::store_operation) {
                         const auto object_size = detail::read_u64(record, offset);
-                        if (object_size > record.size() - offset) {
+                        if (object_size > body_size - offset) {
                             throw std::runtime_error("Database batch object is truncated.");
                         }
                         const auto payload_offset = record_start + detail::record_length_size + offset;
@@ -432,7 +448,7 @@ StorageSnapshot SegmentedStorage::load() {
                             "Database batch record contains an unknown operation.");
                     }
                 }
-                if (offset != record.size()) {
+                if (offset != body_size) {
                     throw std::runtime_error("Database batch record contains trailing data.");
                 }
                 if (!disk_backed_) {
@@ -560,6 +576,7 @@ void SegmentedStorage::apply_batch(const std::vector<StorageMutation>& mutations
         std::count_if(mutations.begin(), mutations.end(), [&](const auto& mutation) {
             return mutation.type == StorageMutationType::store && mutation.id >= next_id_;
         }));
+    detail::append_record_checksum(record);
     const auto record_start = append_payload(std::move(record), next_id, true, created_objects);
     const auto segment_index = segment_files_.size() - 1;
     for (std::size_t index = 0; index < mutations.size(); ++index) {

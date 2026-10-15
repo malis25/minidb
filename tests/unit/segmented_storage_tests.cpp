@@ -41,7 +41,7 @@ TEST(SegmentedStorageTests, CreatesCountBoundedSegmentsAndRecordsHeaderCounts) {
         std::ifstream header(segment, std::ios::binary);
         std::array<char, 8> signature{};
         header.read(signature.data(), static_cast<std::streamsize>(signature.size()));
-        EXPECT_EQ(std::string(signature.data(), signature.size()), std::string("MINIDB3\0", 8));
+        EXPECT_EQ(std::string(signature.data(), signature.size()), std::string("MINIDB4\0", 8));
         header.seekg(40, std::ios::beg);
         std::uint64_t stored_count = 0;
         for (unsigned int shift = 0; shift < 64; shift += 8) {
@@ -119,7 +119,7 @@ TEST(SegmentedStorageTests, ReplaysBatchAsOneAtomicStorageRecord) {
     EXPECT_EQ(restored.get(2)->at("room"), "random");
     std::ifstream manifest_input(manifest_path);
     const auto manifest = nlohmann::json::parse(manifest_input);
-    EXPECT_EQ(manifest["format"], "MINIDB-MANIFEST-4");
+    EXPECT_EQ(manifest["format"], "MINIDB-MANIFEST-5");
 }
 
 TEST(SegmentedStorageTests, RecoversNextIdFromACommittedRecord) {

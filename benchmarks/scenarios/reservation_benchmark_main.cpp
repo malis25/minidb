@@ -45,6 +45,7 @@ struct Options {
     std::uint64_t objects = 4000;
     std::uint64_t repeats = 3;
     std::vector<std::uint64_t> sizes{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+    bool durable = true;
     std::filesystem::path output = "benchmarks/results/reservation-sweep.json";
 };
 
@@ -55,6 +56,16 @@ std::uint64_t parse_unsigned(std::string_view text, std::string_view name) {
         throw std::runtime_error("Invalid value for " + std::string(name) + ": " + std::string(text));
     }
     return value;
+}
+
+bool parse_bool(std::string_view text, std::string_view name) {
+    if (text == "true" || text == "1") {
+        return true;
+    }
+    if (text == "false" || text == "0") {
+        return false;
+    }
+    throw std::runtime_error("Invalid boolean for " + std::string(name) + ": " + std::string(text));
 }
 
 std::vector<std::uint64_t> parse_sizes(std::string_view text) {
@@ -94,11 +105,13 @@ Options parse_options(int argc, char* argv[]) {
             options.repeats = parse_unsigned(next(argument), "--repeats");
         } else if (argument == "--sizes") {
             options.sizes = parse_sizes(next(argument));
+        } else if (argument == "--durable") {
+            options.durable = parse_bool(next(argument), "--durable");
         } else if (argument == "--out") {
             options.output = std::string(next(argument));
         } else if (argument == "--help") {
             std::cout << "Usage: minidb_write_bench [--objects N] [--repeats R] "
-                         "[--sizes 1,2,4,...] [--out PATH]\n";
+                         "[--sizes 1,2,4,...] [--durable true|false] [--out PATH]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + std::string(argument));
@@ -163,7 +176,8 @@ RunResult measure(std::uint64_t reservation, const Options& options) {
     for (std::uint64_t repeat = 0; repeat < options.repeats; ++repeat) {
         TemporaryDirectory directory;
         minidb::SegmentedStorage storage{directory.path(), "bench", 1'000'000,
-                                         default_object_schema(), {}, 0, reservation};
+                                         default_object_schema(), {}, 0, reservation,
+                                         options.durable};
         static_cast<void>(storage.load());
         const auto baseline_writes = storage.manifest_writes();
 
@@ -204,6 +218,8 @@ int main(int argc, char* argv[]) {
         std::cout << "MiniDB next-ID reservation sweep\n";
         std::cout << "  objects/run: " << options.objects << ", repeats: " << options.repeats << '\n';
         std::cout << "  default reservation: " << minidb::default_next_id_reservation << '\n';
+        std::cout << "  durable writes: " << (options.durable ? "yes (fsync per record)" : "no")
+                  << '\n';
 
         std::vector<RunResult> results;
         results.reserve(options.sizes.size());
@@ -223,6 +239,7 @@ int main(int argc, char* argv[]) {
         output["objects"] = options.objects;
         output["repeats"] = options.repeats;
         output["default_reservation"] = minidb::default_next_id_reservation;
+        output["durable"] = options.durable;
         output["results"] = nlohmann::json::array();
         for (const auto& result : results) {
             output["results"].push_back({{"reservation", result.reservation},

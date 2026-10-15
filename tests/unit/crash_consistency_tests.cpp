@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using test_support::default_object_schema;
@@ -48,6 +49,16 @@ void append_u64_le(std::string& out, std::uint64_t value) {
     }
 }
 
+// Mirrors detail::record_checksum so the tests can build well-formed records.
+std::uint64_t record_checksum(std::string_view body) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto byte : body) {
+        hash ^= static_cast<unsigned char>(byte);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 void write_u64_le(std::ostream& out, std::uint64_t value) {
     for (unsigned int shift = 0; shift < 64; shift += 8) {
         out.put(static_cast<char>((value >> shift) & 0xff));
@@ -60,6 +71,7 @@ std::string make_store_record(std::uint64_t id, const std::string& payload) {
     append_u64_le(record, id);
     append_u64_le(record, static_cast<std::uint64_t>(payload.size()));
     record += payload;
+    append_u64_le(record, record_checksum(record));
     return record;
 }
 
@@ -155,6 +167,34 @@ TEST(CrashConsistencyTests, RejectsACommittedRecordWithCorruptPayload) {
         storage.store(0, {{"name", "a"}}, 1);
     }
     append_raw_record(user_segment(directory.path()), make_store_record(1, "{"));
+
+    minidb::SegmentedStorage storage(directory.path(), "users", 10000);
+    EXPECT_THROW(static_cast<void>(storage.load()), std::runtime_error);
+}
+
+// An in-place bit flip inside a committed record keeps the length prefix intact,
+// so only the per-record checksum can detect it; recovery must refuse.
+TEST(CrashConsistencyTests, RejectsABitFlipInsideACommittedRecord) {
+    TemporaryDirectory directory("minidb-crash-");
+    {
+        minidb::SegmentedStorage storage(directory.path(), "users", 10000);
+        static_cast<void>(storage.load());
+        storage.store(0, {{"name", "Ada"}}, 1);
+    }
+    const auto segment = user_segment(directory.path());
+    std::vector<char> bytes;
+    {
+        std::ifstream input(segment, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+    ASSERT_GT(bytes.size(), 82U);
+    // Offset 82 is inside the stored JSON payload (header 56 + length 8 + op 1 +
+    // id 8 + payload size 8 = 81), so the record length stays valid.
+    bytes[82] = static_cast<char>(bytes[82] ^ 0x20);
+    {
+        std::ofstream output(segment, std::ios::binary | std::ios::trunc);
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
 
     minidb::SegmentedStorage storage(directory.path(), "users", 10000);
     EXPECT_THROW(static_cast<void>(storage.load()), std::runtime_error);
@@ -311,6 +351,28 @@ TEST(CrashConsistencyTests, RebuildsATruncatedIndexFile) {
     minidb::Database database{make_disk_storage(directory.path(), {"name"}, 0)};
     EXPECT_EQ(database.size(), 1U);
     EXPECT_EQ(database.find("name", minidb::Object("ada")).size(), 1U);
+}
+
+// Storage opened without the durability barrier must still use the same
+// crash-consistent on-disk format and recover cleanly on reopen; it only skips
+// the fsync, so a process crash is safe even though a power loss may lose the
+// most recent acknowledged writes.
+TEST(CrashConsistencyTests, NonDurableModeKeepsTheOnDiskFormatConsistent) {
+    TemporaryDirectory directory("minidb-crash-");
+    {
+        minidb::SegmentedStorage storage(directory.path(), "users", 10000,
+                                         default_object_schema(), {}, 0, 128, /*durable=*/false);
+        EXPECT_FALSE(storage.durable());
+        static_cast<void>(storage.load());
+        storage.store(0, {{"name", "a"}}, 1);
+        storage.store(1, {{"name", "b"}}, 2);
+    }
+
+    minidb::SegmentedStorage storage(directory.path(), "users", 10000);
+    EXPECT_TRUE(storage.durable());
+    const auto snapshot = storage.load();
+    EXPECT_EQ(object_count(snapshot), 2U);
+    EXPECT_EQ(snapshot.next_id, 2U);
 }
 
 // An abrupt process termination (no destructors, no graceful close) must not lose

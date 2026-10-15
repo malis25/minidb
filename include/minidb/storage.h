@@ -119,6 +119,12 @@ inline constexpr std::uint64_t default_next_id_reservation = 128;
 // ObjectStorage later.
 class SegmentedStorage final : public ObjectStorage {
   public:
+    // `durable` controls whether every accepted write is forced to stable
+    // storage before the call returns (fsync / FlushFileBuffers). Durable storage
+    // survives a power loss or kernel panic at the cost of a per-write disk
+    // barrier; disabling it keeps the same crash-consistent on-disk format and
+    // ordering, so a process crash still cannot corrupt or lose committed records,
+    // but recently acknowledged writes may be lost if the machine loses power.
     SegmentedStorage(std::filesystem::path directory, std::string database_name,
                      std::uint64_t maximum_objects_per_segment = 0,
                      ObjectSchema schema = {{"type", "object"},
@@ -126,7 +132,8 @@ class SegmentedStorage final : public ObjectStorage {
                                             {"additionalProperties", true}},
                      std::vector<std::string> indexed_fields = {},
                      std::uint64_t cache_bytes = 0,
-                     std::uint64_t next_id_reservation = default_next_id_reservation);
+                     std::uint64_t next_id_reservation = default_next_id_reservation,
+                     bool durable = true);
 
     ~SegmentedStorage() override;
 
@@ -150,6 +157,8 @@ class SegmentedStorage final : public ObjectStorage {
     [[nodiscard]] std::uint64_t maximum_objects_per_segment() const noexcept;
     [[nodiscard]] std::uint64_t cache_bytes() const noexcept;
     [[nodiscard]] std::uint64_t next_id_reservation() const noexcept;
+    // True when each accepted write is forced to stable storage before returning.
+    [[nodiscard]] bool durable() const noexcept;
     // Number of manifest writes performed so far; useful for tests and for
     // measuring how often the reservation has to be refreshed.
     [[nodiscard]] std::uint64_t manifest_writes() const noexcept;
@@ -202,6 +211,7 @@ class SegmentedStorage final : public ObjectStorage {
     // manifest write. next_id_ <= next_id_reservation_ always holds.
     std::uint64_t next_id_reservation_size_ = default_next_id_reservation;
     std::uint64_t next_id_reservation_ = 0;
+    bool durable_ = true;
     std::uint64_t manifest_writes_ = 0;
     bool loaded_ = false;
     bool closed_ = false;
