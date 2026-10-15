@@ -16,6 +16,20 @@
 
 namespace minidb {
 
+// A composable query filter used by `Database::query`. Leaves match a single
+// field against a value with an operator; composite nodes combine children with
+// `and`/`or`. `null` values in either side are handled by the comparison
+// operators, so unset fields can be queried explicitly.
+struct FilterNode {
+    bool composite = false;
+    std::string combine = "and"; // "and" / "or"
+    std::vector<FilterNode> children;
+
+    std::string field;
+    std::string op = "eq"; // eq, ne, gt, gte, lt, lte, contains, starts_with, ends_with, exists, is_null, in
+    Object value = nullptr;
+};
+
 struct ObjectMatch {
     std::uint64_t id = 0;
     std::shared_ptr<const Object> object;
@@ -112,6 +126,15 @@ class Database {
     [[nodiscard]] ObjectMatchPage find_after(std::string_view field, const Object& value,
                                              std::optional<std::uint64_t> after_id,
                                              std::size_t limit) const;
+    // Filtered query with comparison/boolean operators. Empty leaves are treated
+    // as "match everything"; returns a page whose `total` reflects the full
+    // matching set. Indexes are not consulted: the predicate runs on each
+    // object, which keeps indexing out of the query semantics.
+    [[nodiscard]] ObjectMatchPage query(const FilterNode& filter, std::size_t offset,
+                                        std::size_t limit) const;
+    [[nodiscard]] ObjectMatchPage query(const FilterNode& filter,
+                                       std::optional<std::uint64_t> after_id,
+                                       std::size_t limit) const;
     [[nodiscard]] std::uint64_t next_id() const noexcept;
 
   private:

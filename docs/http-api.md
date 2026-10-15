@@ -295,8 +295,34 @@ Unknown IDs return HTTP 404. A deleted ID is not reused.
 
 ### `POST /databases/{name}/query`
 
-Finds objects whose **top-level** field equals a JSON value. Query pagination
-uses the same URL parameters as ID listing.
+Finds objects whose **top-level** properties match a filter. The legacy equality
+form (`{"field":..., "equals":...}`) remains supported. Query pagination uses
+the same URL parameters as ID listing.
+
+Simple filter (one field, one operator):
+
+```http
+POST /databases/users/query?limit=20&offset=0
+Content-Type: application/json
+
+{"field":"email","op":"eq","value":"ada@example.test"}
+```
+
+Compound filter:
+
+```http
+POST /databases/users/query?limit=20&offset=0
+Content-Type: application/json
+
+{"filter":{"and":[{"field":"status","op":"eq","value":"active"},
+                 {"field":"age","op":"gte","value":18}]}}
+```
+
+Supported leaf operators: `eq` (default), `ne`/`neq`, `gt`, `gte`, `lt`, `lte`,
+`contains`, `starts_with`, `ends_with`, `exists`, `is_null`, `in` (value is an
+array). Unknown operators or malformed filters return HTTP 400.
+
+Advanced combined-and-cursor example:
 
 ```http
 POST /databases/users/query?limit=20&offset=0
@@ -320,8 +346,9 @@ Content-Type: application/json
 
 Every top-level property is indexed in memory, and any field listed in
 `indexed_fields` additionally has an on-disk B+ tree. Equality is exact and
-type-sensitive. Nested subfields, array-element membership, ranges, text
-search, and compound conditions are not supported. Unknown fields or values
+type-sensitive. Top-level fields only are supported: nested subfields (`profile.city`), array
+element tests, and full-text search are still unavailable, but ranges and
+compound `and`/`or` conditions are. Unknown fields or values
 return an empty page. Missing or invalid query fields return HTTP 400. Offset
 pagination must collect matching IDs to select and order the requested page;
 large offset-based result sets therefore require temporary memory proportional

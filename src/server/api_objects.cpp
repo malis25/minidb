@@ -12,6 +12,81 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+const char* const allowed_ops[] = {"eq", "ne", "neq", "gt", "gte", "lt", "lte",
+                                     "contains", "starts_with", "ends_with",
+                                     "exists", "is_null", "in"};
+
+bool op_allowed(const std::string& op) {
+    for (const auto* candidate : allowed_ops) {
+        if (op == candidate) return true;
+    }
+    return false;
+}
+
+bool parse_filter_node(const nlohmann::json& json, minidb::FilterNode& node,
+                       httplib::Response& response) {
+    if (!json.is_object()) {
+        send_error(response, "Query filter must be a JSON object.",
+                   httplib::StatusCode::BadRequest_400);
+        return false;
+    }
+    if (json.contains("and") || json.contains("or")) {
+        node.composite = true;
+        node.combine = json.contains("and") ? std::string("and") : std::string("or");
+        const auto& children = json.contains("and") ? json["and"] : json["or"];
+        if (!children.is_array() || children.empty()) {
+            send_error(response, "Query combinator must be a non-empty array.",
+                       httplib::StatusCode::BadRequest_400);
+            return false;
+        }
+        for (const auto& child : children) {
+            minidb::FilterNode child_node;
+            if (!parse_filter_node(child, child_node, response)) return false;
+            node.children.push_back(std::move(child_node));
+        }
+        return true;
+    }
+
+    node.composite = false;
+    if (!json.contains("field") || !json["field"].is_string() ||
+        json["field"].get_ref<const std::string&>().empty()) {
+        send_error(response, "Query requires a non-empty string field.",
+                   httplib::StatusCode::BadRequest_400);
+        return false;
+    }
+    node.field = json["field"].get<std::string>();
+    node.op = "eq";
+    if (json.contains("op")) {
+        if (!json["op"].is_string()) {
+            send_error(response, "Query operator must be a string.",
+                       httplib::StatusCode::BadRequest_400);
+            return false;
+        }
+        node.op = json["op"].get<std::string>();
+    }
+    if (!op_allowed(node.op)) {
+        send_error(response, "Unsupported query operator: " + node.op,
+                   httplib::StatusCode::BadRequest_400);
+        return false;
+    }
+    if (json.contains("value")) {
+        node.value = json["value"];
+    } else if (json.contains("equals")) {
+        node.value = json["equals"];
+    } else if (node.op != "exists" && node.op != "is_null") {
+        send_error(response, "Query requires a value (value or equals).",
+                   httplib::StatusCode::BadRequest_400);
+        return false;
+    } else {
+        node.value = nullptr;
+    }
+    return true;
+}
+
+} // namespace
+
 // Object routes: listing IDs, querying, batched mutation, and single-object
 // create/read/replace/delete.
 void DatabaseApi::register_object_routes(httplib::Server& server) {
@@ -44,11 +119,29 @@ void DatabaseApi::register_object_routes(httplib::Server& server) {
                                                  httplib::Response& response) {
         const auto name = request.path_params.at("name");
         Page page;
-        std::string field;
-        nlohmann::json value;
-        if (!parse_page(request, page, response) || !parse_query(request, field, value, response)) {
+        if (!parse_page(request, page, response)) {
             return;
         }
+        nlohmann::json body;
+        if (!parse_json_body(request, body, response)) {
+            return;
+        }
+        minidb::FilterNode filter;
+        if (body.contains("filter")) {
+            if (!parse_filter_node(body["filter"], filter, response)) return;
+        } else if (body.contains("and") || body.contains("or") || body.contains("field")) {
+            if (!parse_filter_node(body, filter, response)) return;
+        } else {
+            // Backwards-compatible shortcut: {field, equals} still works.
+            std::string field;
+            nlohmann::json value;
+            if (!parse_query(request, field, value, response)) return;
+            filter.composite = false;
+            filter.field = std::move(field);
+            filter.op = "eq";
+            filter.value = std::move(value);
+        }
+
         const auto database = find_database(catalog_, name, response);
         if (!database) {
             return;
@@ -57,12 +150,12 @@ void DatabaseApi::register_object_routes(httplib::Server& server) {
         if (!is_active(database, name, response)) {
             return;
         }
+        minidb::ObjectMatchPage matches;
         if (page.after_id) {
-            const auto matches =
-                database->database.find_after(field, value, page.after_id, page.limit);
+            matches = database->database.query(filter, page.after_id, page.limit);
             send_json(response, cursor_matches(matches, page), httplib::StatusCode::OK_200);
         } else {
-            const auto matches = database->database.find(field, value, page.offset, page.limit);
+            matches = database->database.query(filter, page.offset, page.limit);
             send_json(response, paged_matches(matches, page), httplib::StatusCode::OK_200);
         }
     });
