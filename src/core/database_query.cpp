@@ -104,7 +104,7 @@ ObjectMatchPage Database::find(std::string_view field, const Object& value, std:
             std::any_of(fields.begin(), fields.end(), [&](const std::string& name) {
                 return std::string_view{name} == field;
             });
-        std::vector<std::uint64_t> matching_ids;
+        std::vector<ObjectMatch> matching;
         const auto encoded = detail::indexed_value(value);
         if (indexed) {
             for (const auto id : storage_->query_index(field, encoded)) {
@@ -114,7 +114,7 @@ ObjectMatchPage Database::find(std::string_view field, const Object& value, std:
                 }
                 const auto entry = object->find(std::string(field));
                 if (entry != object->end() && entry->dump() == encoded) {
-                    matching_ids.push_back(id);
+                    matching.push_back({id, object});
                 }
             }
         } else {
@@ -125,22 +125,19 @@ ObjectMatchPage Database::find(std::string_view field, const Object& value, std:
                 }
                 const auto entry = object->find(std::string(field));
                 if (entry != object->end() && entry->dump() == encoded) {
-                    matching_ids.push_back(id);
+                    matching.push_back({id, object});
                 }
             }
         }
         ObjectMatchPage result;
-        result.total = matching_ids.size();
+        result.total = matching.size();
         if (limit == 0 || offset >= result.total) {
             return result;
         }
-        const auto end = offset + std::min(limit, matching_ids.size() - offset);
+        const auto end = offset + std::min(limit, matching.size() - offset);
         result.matches.reserve(end - offset);
         for (std::size_t index = offset; index < end; ++index) {
-            const auto object = storage_->read(matching_ids[index]);
-            if (object != nullptr) {
-                result.matches.push_back({matching_ids[index], object});
-            }
+            result.matches.push_back(matching[index]);
         }
         return result;
     }
