@@ -3,7 +3,9 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -155,4 +157,81 @@ TEST(BPlusTreeTests, ClearsEveryEntry) {
     EXPECT_FALSE(tree.get("alpha", value));
     auto cursor = tree.begin();
     EXPECT_FALSE(cursor.valid());
+}
+
+namespace {
+
+std::uint64_t read_u64_be(const std::vector<char>& bytes, std::size_t offset) {
+    std::uint64_t value = 0;
+    for (unsigned int shift = 0; shift < 64; shift += 8) {
+        value = (value << 8) | static_cast<unsigned char>(bytes[offset + shift / 8]);
+    }
+    return value;
+}
+
+void overwrite_byte(const std::filesystem::path& path, std::uint64_t offset, char value) {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(file);
+    file.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
+    file.put(value);
+}
+
+} // namespace
+
+// A header whose checksum no longer matches its fields is unusable.
+TEST(BPlusTreeTests, RejectsACorruptHeaderChecksum) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "index.idx";
+    {
+        minidb::BPlusTree tree(path);
+        tree.put("alpha", "one");
+        tree.put("beta", "two");
+    }
+    // Flip the low byte of the entry-count field, leaving magic and page size
+    // intact so only the checksum can detect the corruption.
+    overwrite_byte(path, 33, static_cast<char>(0x7f));
+
+    EXPECT_THROW(minidb::BPlusTree tree(path), std::runtime_error);
+}
+
+// A page whose type byte is invalid must raise an explicit error when read.
+TEST(BPlusTreeTests, RejectsAnInvalidPageType) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "index.idx";
+    std::uint64_t root_page = 0;
+    {
+        minidb::BPlusTree tree(path);
+        tree.put("alpha", "one");
+        tree.put("beta", "two");
+    }
+    {
+        std::fstream file(path, std::ios::binary | std::ios::in);
+        std::vector<char> header(minidb::BPlusTree::node_size, 0);
+        file.read(header.data(), static_cast<std::streamsize>(header.size()));
+        root_page = read_u64_be(header, 20);
+    }
+    ASSERT_NE(root_page, 0U);
+    overwrite_byte(path, root_page * minidb::BPlusTree::node_size, static_cast<char>(0));
+
+    minidb::BPlusTree tree(path);
+    std::string value;
+    EXPECT_THROW(static_cast<void>(tree.get("alpha", value)), std::runtime_error);
+}
+
+// A file shorter than one page has no header and is rebuilt as an empty tree.
+TEST(BPlusTreeTests, TreatsATruncatedFileAsEmpty) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "index.idx";
+    {
+        minidb::BPlusTree tree(path);
+        tree.put("alpha", "one");
+    }
+    std::filesystem::resize_file(path, 3);
+
+    minidb::BPlusTree tree(path);
+    EXPECT_EQ(tree.live_entries(), 0U);
+    tree.put("fresh", "value");
+    std::string value;
+    ASSERT_TRUE(tree.get("fresh", value));
+    EXPECT_EQ(value, "value");
 }

@@ -1,5 +1,6 @@
 #include "minidb/storage.h"
 
+#include "file_sync.h"
 #include "segmented_storage_internal.h"
 
 #include <array>
@@ -35,16 +36,7 @@ std::shared_ptr<const Object> SegmentedStorage::object_at(const ObjectLocation& 
     if (!input) {
         throw std::runtime_error("Could not read a stored object: " + segment_path.string());
     }
-    auto object =
-        Object::parse(payload, [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
-            if (depth > maximum_object_nesting_depth) {
-                throw std::length_error("Stored JSON nesting exceeds the maximum depth of 128.");
-            }
-            return true;
-        });
-    if (!object.is_object()) {
-        throw std::runtime_error("Stored record does not contain a JSON object.");
-    }
+    auto object = detail::parse_stored_object(payload, segment_path);
     return std::make_shared<const Object>(std::move(object));
 }
 
@@ -176,6 +168,10 @@ std::uint64_t SegmentedStorage::append_payload(std::string record, std::uint64_t
         }
     }
     file.close();
+    // Durability barrier: the record (and its counted header slot) must reach
+    // stable storage before the next-ID reservation manifest is allowed to
+    // advance, so recovery can never observe a reservation ahead of its data.
+    detail::sync_file(segment_path);
 
     if (update_next_id && next_id != next_id_) {
         const auto previous_next_id = next_id_;
@@ -241,6 +237,9 @@ void SegmentedStorage::create_segment(const std::string& filename) {
     if (!output) {
         throw std::runtime_error("Could not initialize database segment: " + segment_path.string());
     }
+    // The new segment must exist on disk before the manifest lists it; otherwise
+    // a crash could leave a manifest that references a missing segment.
+    detail::sync_file(segment_path);
 }
 
 void SegmentedStorage::update_segment_object_count(const std::filesystem::path& path,

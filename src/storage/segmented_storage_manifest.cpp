@@ -1,5 +1,6 @@
 #include "minidb/storage.h"
 
+#include "file_sync.h"
 #include "segmented_storage_internal.h"
 
 #include <chrono>
@@ -82,7 +83,12 @@ void SegmentedStorage::save_manifest() {
         throw std::runtime_error("Could not finish writing database manifest: " +
                                  temporary_path.string());
     }
+    // Order matters: flush the new manifest's contents before the atomic rename,
+    // then flush the directory entry so the rename itself survives a crash. A
+    // reader therefore sees either the old or the new manifest, never a torn one.
+    detail::sync_file(temporary_path);
     replace_file(temporary_path, manifest_path_);
+    detail::sync_directory(directory_);
     ++manifest_writes_;
 }
 

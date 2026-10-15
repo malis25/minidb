@@ -351,18 +351,8 @@ StorageSnapshot SegmentedStorage::load() {
                     throw std::runtime_error("Database object record has an invalid payload size.");
                 }
                 const auto payload_offset = record_start + detail::record_length_size + offset;
-                auto object = Object::parse(
-                    std::string_view{record}.substr(offset),
-                    [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
-                        if (depth > maximum_object_nesting_depth) {
-                            throw std::length_error(
-                                "Stored JSON nesting exceeds the maximum depth of 128.");
-                        }
-                        return true;
-                    });
-                if (!object.is_object()) {
-                    throw std::runtime_error("Database record does not contain a JSON object.");
-                }
+                auto object = detail::parse_stored_object(std::string_view{record}.substr(offset),
+                                                          segment_path);
                 if (stored_ids.insert(id).second) {
                     ++recovered_object_count;
                 }
@@ -408,20 +398,10 @@ StorageSnapshot SegmentedStorage::load() {
                             throw std::runtime_error("Database batch object is truncated.");
                         }
                         const auto payload_offset = record_start + detail::record_length_size + offset;
-                        auto object = Object::parse(
+                        auto object = detail::parse_stored_object(
                             std::string_view{record}.substr(
                                 offset, static_cast<std::size_t>(object_size)),
-                            [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
-                                if (depth > maximum_object_nesting_depth) {
-                                    throw std::length_error(
-                                        "Stored JSON nesting exceeds the maximum depth of 128.");
-                                }
-                                return true;
-                            });
-                        if (!object.is_object()) {
-                            throw std::runtime_error(
-                                "Database batch record does not contain a JSON object.");
-                        }
+                            segment_path);
                         offset += static_cast<std::size_t>(object_size);
                         if (stored_ids.insert(mutation_id).second) {
                             ++recovered_object_count;

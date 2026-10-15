@@ -125,7 +125,7 @@ std::vector<std::uint64_t> SegmentedStorage::query_index(std::string_view field,
 }
 
 void SegmentedStorage::build_index_tree(const std::string& field) {
-    auto tree = std::make_unique<BPlusTree>(index_path(field));
+    auto tree = open_index_tree(field);
     tree->clear();
     std::vector<std::uint64_t> ids;
     ids.reserve(object_locations_.size());
@@ -151,9 +151,22 @@ void SegmentedStorage::open_index_trees() {
     detail::require_valid_indexed_fields(indexed_fields_);
     index_trees_.clear();
     for (const auto& field : indexed_fields_) {
-        auto tree = std::make_unique<BPlusTree>(index_path(field));
+        auto tree = open_index_tree(field);
         tree->clear();
         index_trees_[field] = std::move(tree);
+    }
+}
+
+std::unique_ptr<BPlusTree> SegmentedStorage::open_index_tree(const std::string& field) {
+    const auto path = index_path(field);
+    try {
+        return std::make_unique<BPlusTree>(path);
+    } catch (const std::exception&) {
+        // The index is rebuilt from the segment log on every open, so a damaged
+        // file is discarded rather than propagated to the caller.
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        return std::make_unique<BPlusTree>(path);
     }
 }
 

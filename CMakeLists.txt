@@ -39,6 +39,7 @@ add_library(minidb_core
     src/core/database.cpp
     src/core/database_query.cpp
     src/index/bplus_tree.cpp
+    src/storage/file_sync.cpp
     src/storage/segmented_storage.cpp
     src/storage/segmented_storage_io.cpp
     src/storage/segmented_storage_index.cpp

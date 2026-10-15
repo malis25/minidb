@@ -8,7 +8,7 @@ namespace minidb {
 
 namespace {
 
-constexpr char tree_magic[8] = {'M', 'I', 'N', 'I', 'D', 'X', '0', '1'};
+constexpr char tree_magic[8] = {'M', 'I', 'N', 'I', 'D', 'X', '0', '2'};
 constexpr char internal_page = 1;
 constexpr char leaf_page = 2;
 
@@ -17,6 +17,19 @@ constexpr std::size_t header_next_page = 12;
 constexpr std::size_t header_root_page = 20;
 constexpr std::size_t header_height = 28;
 constexpr std::size_t header_entry_count = 32;
+// A checksum over the header fields detects a torn or bit-flipped header. The
+// index is rebuilt from the object log, so an invalid header only triggers a
+// rebuild rather than data loss.
+constexpr std::size_t header_checksum_offset = 40;
+
+std::uint64_t tree_header_checksum(const std::vector<char>& header) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (std::size_t index = 0; index < header_checksum_offset; ++index) {
+        hash ^= static_cast<unsigned char>(header[index]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
 void put_u16(std::vector<char>& buffer, std::size_t offset, std::uint16_t value) {
     buffer[offset] = static_cast<char>((value >> 8) & 0xff);
@@ -104,6 +117,9 @@ void BPlusTree::load() {
         read_u32(header, header_page_size) != node_size) {
         throw std::runtime_error("Invalid B+ tree file: " + path_.string());
     }
+    if (read_u64(header, header_checksum_offset) != tree_header_checksum(header)) {
+        throw std::runtime_error("Corrupt B+ tree header: " + path_.string());
+    }
     next_page_ = read_u64(header, header_next_page);
     root_page_ = read_u64(header, header_root_page);
     height_ = read_u32(header, header_height);
@@ -118,6 +134,7 @@ void BPlusTree::write_header() {
     put_u64(header, header_root_page, root_page_);
     put_u32(header, header_height, height_);
     put_u64(header, header_entry_count, entry_count_);
+    put_u64(header, header_checksum_offset, tree_header_checksum(header));
     write_page(0, header);
 }
 
@@ -163,7 +180,7 @@ void BPlusTree::write_page(std::uint64_t page_id, const std::vector<char>& buffe
 }
 
 BPlusTree::InternalNode BPlusTree::decode_internal(const std::vector<char>& page) const {
-    if (page[0] != internal_page) {
+    if (page.size() < node_size || page[0] != internal_page) {
         throw std::runtime_error("Corrupt B+ tree internal page: " + path_.string());
     }
     InternalNode node;
@@ -171,11 +188,20 @@ BPlusTree::InternalNode BPlusTree::decode_internal(const std::vector<char>& page
     std::size_t offset = 3;
     node.children.reserve(static_cast<std::size_t>(count) + 1);
     node.keys.reserve(count);
+    if (offset + 8 > page.size()) {
+        throw std::runtime_error("Truncated B+ tree internal page: " + path_.string());
+    }
     node.children.push_back(read_u64(page, offset));
     offset += 8;
     for (std::uint16_t index = 0; index < count; ++index) {
+        if (offset + 2 > page.size()) {
+            throw std::runtime_error("Truncated B+ tree internal page: " + path_.string());
+        }
         const auto key_length = read_u16(page, offset);
         offset += 2;
+        if (offset + key_length + 8 > page.size()) {
+            throw std::runtime_error("Corrupt B+ tree internal page: " + path_.string());
+        }
         node.keys.emplace_back(page.data() + offset, key_length);
         offset += key_length;
         node.children.push_back(read_u64(page, offset));
@@ -186,15 +212,21 @@ BPlusTree::InternalNode BPlusTree::decode_internal(const std::vector<char>& page
 
 std::vector<BPlusTree::LeafEntry> BPlusTree::decode_leaf(const std::vector<char>& page,
                                                          std::uint64_t& next_leaf) const {
-    if (page[0] != leaf_page) {
+    if (page.size() < node_size || page[0] != leaf_page) {
         throw std::runtime_error("Corrupt B+ tree leaf page: " + path_.string());
     }
     const auto count = read_u16(page, 1);
+    if (11 > page.size()) {
+        throw std::runtime_error("Truncated B+ tree leaf page: " + path_.string());
+    }
     next_leaf = read_u64(page, 3);
     std::size_t offset = 11;
     std::vector<LeafEntry> entries;
     entries.reserve(count);
     for (std::uint16_t index = 0; index < count; ++index) {
+        if (offset + 5 > page.size()) {
+            throw std::runtime_error("Truncated B+ tree leaf page: " + path_.string());
+        }
         LeafEntry entry;
         entry.deleted = page[offset] != 0;
         offset += 1;
@@ -202,6 +234,9 @@ std::vector<BPlusTree::LeafEntry> BPlusTree::decode_leaf(const std::vector<char>
         offset += 2;
         const auto value_length = read_u16(page, offset);
         offset += 2;
+        if (offset + key_length + value_length > page.size()) {
+            throw std::runtime_error("Corrupt B+ tree leaf page: " + path_.string());
+        }
         entry.key.assign(page.data() + offset, key_length);
         offset += key_length;
         entry.value.assign(page.data() + offset, value_length);

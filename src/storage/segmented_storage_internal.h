@@ -1,5 +1,7 @@
 #pragma once
 
+#include "minidb/object.h"
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -181,6 +183,29 @@ inline bool read_header_slot(std::istream& input, std::uint64_t& generation,
         return checksum == header_checksum(generation, object_count);
     } catch (const std::runtime_error&) {
         return false;
+    }
+}
+
+// Parses a stored JSON payload, translating parser failures into a storage error
+// that names the segment. A corrupt record must surface as an explicit failure,
+// never as a silently skipped object.
+inline Object parse_stored_object(std::string_view payload,
+                                  const std::filesystem::path& segment_path) {
+    try {
+        auto object =
+            Object::parse(payload, [](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+                if (depth > maximum_object_nesting_depth) {
+                    throw std::length_error("Stored JSON nesting exceeds the maximum depth of 128.");
+                }
+                return true;
+            });
+        if (!object.is_object()) {
+            throw std::runtime_error("Stored record does not contain a JSON object.");
+        }
+        return object;
+    } catch (const nlohmann::json::exception& error) {
+        throw std::runtime_error("Database segment contains invalid JSON (" +
+                                 std::string(error.what()) + "): " + segment_path.string());
     }
 }
 

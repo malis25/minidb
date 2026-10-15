@@ -179,6 +179,10 @@ class SegmentedStorage final : public ObjectStorage {
 
     void open_index_trees();
     void build_index_tree(const std::string& field);
+    // Opens an index tree, discarding and recreating the file when it is missing
+    // or damaged. Indexes are derived data rebuilt from the segment log, so a
+    // corrupt index must never prevent the database from opening.
+    [[nodiscard]] std::unique_ptr<BPlusTree> open_index_tree(const std::string& field);
     void insert_into_indexes(std::uint64_t id, const Object& object);
     void remove_from_indexes(std::uint64_t id, const Object& object);
     [[nodiscard]] std::shared_ptr<const Object> object_at(const ObjectLocation& location) const;
